@@ -1,0 +1,18 @@
+# clangd configuration for Remora.
+#
+# The project's CMakeLists.txt sets CMAKE_CXX_STANDARD to 20 and finds ggml
+# via Homebrew's pkg-config. Tell clangd the same so its indexer accepts
+# C++17/20 features (std::filesystem, structured bindings, etc.) and finds
+# ggml.h under Homebrew's prefix.
+
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -DREMORA_HAVE_GGML=1
+    - -I/opt/homebrew/Cellar/ggml/0.17.0/include
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None

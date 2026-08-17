@@ -1,0 +1,6 @@
+#!/Users/henry/Developer/Remora/.venv/bin/python
+import sys
+from gguf.scripts.gguf_dump import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

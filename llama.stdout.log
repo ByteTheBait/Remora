@@ -1,0 +1,36 @@
+
+
+Loading model... |-\|/ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b10180-11b068d06
+model      : mamba-1.4b-hf.Q4_K_M.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> Hello, my name is
+<|im_start|>assistant@cs.williams.edu
+<|im_start|>assistant@cs.williams.edu
+<|im_start|>assistant@cs.williams.edu
+<|im_start|>assistant@cs.willi
+
+[ Prompt: 233.2 t/s | Generation: 52.8 t/s ]
+
+
+Exiting...

@@ -93,15 +93,24 @@ builds the engine, and runs the layer-by-layer execution loop.
 ### Run manually
 
 ```bash
-# 1. Shard a GGUF model into per-layer files
-python3 scripts/shard_gguf.py model.gguf --out layers/
+# 1. Download a Mamba model (GGUF)
+curl -L -o mamba-1.4b-hf.Q4_K_M.gguf \
+    "https://huggingface.co/bartowski/mamba-1.4b-hf-GGUF/resolve/main/mamba-1.4b-hf.Q4_K_M.gguf"
 
-# 2. Run the engine with a routing table
+# 2. Shard the GGUF into per-layer files
+python3 scripts/shard_gguf.py mamba-1.4b-hf.Q4_K_M.gguf --out layers/
+
+# 3. Run the engine with a routing table
 ./build/remora \
     --routing examples/basic_routing.json \
     --layers layers/ \
     --tokens 8
 ```
+
+The engine discovers every `blk.*` file in the layers directory, sorts them by
+block index, and streams them one at a time through the double-buffered loader.
+For the 1.4B Mamba model this is 48 layers (~15 MB each, ~733 MB total) — all
+streamed from disk with a constant O(1) resident state.
 
 ---
 

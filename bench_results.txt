@@ -1,0 +1,27 @@
+============================================================
+Mamba 1.4B Q4_K_M  —  Remora vs llama.cpp
+============================================================
+metric                         | Remora                 | llama.cpp             
+------------------------------+------------------------+------------------------
+model                          | mamba-1.4b-hf.Q4_K_M.gguf | mamba-1.4b-hf.Q4_K_M.gguf
+sharded?                       | yes (48 blocks)        | no (single file)      
+wall time (ms)                 | 71                     | 2165                  
+TTFT (ms)                      | 78                     | 2165                  
+tokens generated               | 0 (placeholder)        | 64                    
+tokens/sec                     | n/a                    | N/A                   
+gen tok/s (inline)             | n/a                    | 52.8                  
+prompt tok/s (inline)          | n/a                    | 233.2                 
+layers/sec (proxy)             | 676.06                 | n/a                   
+stream throughput              | 9845.1 MiB/s           | n/a (mmap-once)       
+peak RSS (MiB)                 | 1.0                    | 869.9                 
+exit code                      | 0                      | 0                     
+
+Notes:
+  * Remora's RNN kernel is currently a placeholder (h = 0.9h + 0.1x over a
+    64-dim state). It streams real bytes off disk via mmap, but does NOT
+    run a real Mamba selective scan. 'layers/sec' is a work-rate proxy.
+  * 'TTFT' for Remora is measured as wall time until the first per-layer
+    printf; llama.cpp's is (total_ms - eval_ms), which still includes
+    prompt processing.
+  * RSS is sampled from `ps -o rss=` at 20 Hz; peak is the max.
+
