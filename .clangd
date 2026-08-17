@@ -1,14 +1,20 @@
 # clangd configuration for Remora.
 #
-# The project's CMakeLists.txt sets CMAKE_CXX_STANDARD to 20 and finds ggml
-# via Homebrew's pkg-config. Tell clangd the same so its indexer accepts
-# C++17/20 features (std::filesystem, structured bindings, etc.) and finds
-# ggml.h under Homebrew's prefix.
+# The project vendors llama.cpp under third_party/llama.cpp/, which in turn
+# vendors its own ggml under third_party/llama.cpp/ggml/. The header search
+# path for *our* sources is therefore the vendored ggml, not Homebrew's.
+# Homebrew's ggml 0.17.0 lacks some types (GGML_ROPE_TYPE_NEOX, etc.) that
+# the vendored header depends on, so pointing clangd at Homebrew's prefix
+# produces spurious "undeclared identifier" errors when it tries to index
+# llama.h.
 
 CompileFlags:
   Add:
     - -std=c++20
     - -DREMORA_HAVE_GGML=1
+    - -I/Users/henry/Developer/Remora/third_party/llama.cpp/ggml/include
+    - -I/Users/henry/Developer/Remora/third_party/llama.cpp/include
+    - -I/Users/henry/Developer/Remora/third_party/llama.cpp/common
     - -I/opt/homebrew/Cellar/ggml/0.17.0/include
 
 Index:

@@ -236,18 +236,6 @@ extern "C" {
 
     typedef bool (*llama_progress_callback)(float progress, void * user_data);
 
-    // REMORA PATCH: per-tensor data callback.
-    // When set, llama_model_loader::load_data_for() will NOT use its internal
-    // file mapping; instead it will call this function once per tensor with
-    // the tensor's name and offset/size within the (synthetic) source file.
-    // The callback must return a pointer to `size` bytes containing the
-    // tensor's data. Ownership of the returned memory is not transferred;
-    // llama.cpp copies the bytes into the ggml buffer and the callback is
-    // free to free the memory once it returns. Pass NULL to fall back to
-    // the default in-file mapping.
-    typedef const void * (*llama_tensor_data_callback)(
-        const char * tensor_name, size_t offset, size_t size, void * user_data);
-
     // Input data for llama_encode/llama_decode
     // A llama_batch object can contain input about one or many sequences
     // The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
@@ -349,12 +337,6 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
-
-        // REMORA PATCH: per-tensor data callback. When non-NULL, libllama
-        // calls this for each tensor instead of reading from the mmap'd
-        // source file. See llama_tensor_data_callback above.
-        llama_tensor_data_callback tensor_data_callback;
-        void * tensor_data_callback_user_data;
     };
 
     struct llama_sampler_seq_config {

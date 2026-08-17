@@ -76,7 +76,17 @@ def _kv_array(reader, key: str):
 
 
 def _write_shard(out_dir: str, name: str, tensors: list) -> str:
-    """Write a shard (raw bytes) and its sidecar; return the meta path."""
+    """Write a shard (raw bytes) and its sidecar; return the meta path.
+
+    Each tensor entry records both:
+      - ``offset``: shard-relative byte offset (where the bytes live in this
+        shard file). Used if a runtime reads the shard directly.
+      - ``file_offset``: absolute byte offset within the *original* GGUF
+        file's tensor data section (i.e. ``gguf_get_tensor_offset``).
+        Used by the libllama-based driver, which passes the original GGUF
+        path to ``gguf_init_from_file`` for header parsing and then resolves
+        tensor bytes through a per-tensor callback keyed on this offset.
+    """
     raw_path = os.path.join(out_dir, name)
     meta_path = os.path.join(out_dir, name + ".meta.json")
     sidecar = {"name": name, "tensors": []}
@@ -85,12 +95,13 @@ def _write_shard(out_dir: str, name: str, tensors: list) -> str:
         for t in tensors:
             data = t.data.tobytes()
             sidecar["tensors"].append({
-                "name":       t.name,
-                "shape":      [int(x) for x in t.shape],
-                "dtype":      _gguf_type_name(t.tensor_type),
-                "offset":     offset,
-                "size":       len(data),
-                "n_elements": int(t.n_elements),
+                "name":         t.name,
+                "shape":        [int(x) for x in t.shape],
+                "dtype":        _gguf_type_name(t.tensor_type),
+                "offset":       offset,
+                "file_offset":  int(t.data_offset),
+                "size":         len(data),
+                "n_elements":   int(t.n_elements),
             })
             f.write(data)
             offset += len(data)
