@@ -24,7 +24,8 @@ inline double remora_clangd_cmath_keep(double x) {
 // ---------------------------------------------------------------------------
 #ifndef REMORA_HAVE_GGML
 
-std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer) {
+std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer,
+                              ComputeEngine& /*engine*/) {
     // Pretend we ran a real forward pass: the residual stream is left
     // untouched but the layer is "consumed". This is for build smoke-tests
     // and for benchmarking the I/O scaffolding without real math.
@@ -68,24 +69,100 @@ std::size_t remora_tensor_nbytes(ggml_type type,
 }
 
 // ---------------------------------------------------------------------------
-// Build a ggml_context that owns one block's worth of tensors. Each tensor's
-// `.data` pointer is wired to point into the memory-mapped shard file at the
-// recorded offset. The caller takes ownership of the returned context.
-//
-// Allocation strategy: a small no-alloc context for the metadata, plus
-// `ggml_backend_alloc_ctx_tensors_from_buft` to allocate the actual
-// per-tensor storage from the CPU backend buffer. For *quantized* tensors
-// we then overwrite `.data` with a pointer into the shard. For F32 tensors
-// we copy the bytes in (since the rest of the network assumes ownership).
+// ComputeEngine: persistent backends + scheduler (GPU-first, CPU fallback).
 // ---------------------------------------------------------------------------
 
+// Helper to strip a leading "blk.N." prefix from a sidecar tensor name.
+static std::string strip_blk_prefix(const std::string& name) {
+    if (name.rfind("blk.", 0) != 0) return name;
+    const auto dot = name.find('.', 4);
+    if (dot != std::string::npos) return name.substr(dot + 1);
+    return name;
+}
+
+ComputeEngine::ComputeEngine() {
+    // This runtime's Mamba forward reads and writes activation tensors
+    // directly through their host `->data` pointers: the hand-rolled
+    // conv1d / selective-scan / silu loops and the memcpy's that stage
+    // activations between ggml graphs. That direct access is only valid
+    // if every tensor in the compute graph lives in host-visible memory.
+    //
+    // The Metal backend on the ggml releases we target only exposes its
+    // tensor API on M5/A19+ silicon (it reports "has tensor = false" on
+    // an Apple M2 and fails to compile its shaders when forced), and a
+    // BLAS/ACCEL primary backend leaves matmul *result* tensors in device
+    // memory where `->data` is not meaningful. A GPU path would require
+    // explicit staging with ggml_backend_tensor_get/set, which is a
+    // separate refactor.
+    //
+    // For a correct baseline we therefore run on the CPU backend only.
+    // The scheduler also asserts that its *last* backend is CPU, so a
+    // single CPU backend trivially satisfies that invariant.
+    ggml_backend_t cpu =
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (cpu) {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(cpu);
+        if (buft) {
+            backends_.push_back(cpu);
+            bufts_.push_back(buft);
+        } else {
+            ggml_backend_free(cpu);
+        }
+    }
+
+    if (backends_.empty()) {
+        std::fprintf(stderr, "[remora] ComputeEngine: no ggml backends available\n");
+        return;
+    }
+
+    // One scheduler for the whole run. Graph size is generous so the
+    // scheduler can hold the full Mamba forward graph without realloc.
+    sched_ = ggml_backend_sched_new(backends_.data(), bufts_.data(),
+                                    (int) backends_.size(),
+                                    16384, /*parallel=*/false, /*op_offload=*/true);
+    if (!sched_) {
+        std::fprintf(stderr, "[remora] ComputeEngine: failed to create scheduler\n");
+    }
+}
+
+ComputeEngine::~ComputeEngine() {
+    if (sched_) ggml_backend_sched_free(sched_);
+    for (auto b : backends_) ggml_backend_free(b);
+}
+
+const char* ComputeEngine::primary_backend_name() const {
+    if (backends_.empty()) return "none";
+    return ggml_backend_name(backends_.front());
+}
+
+bool ComputeEngine::compute(struct ggml_cgraph* gf) {
+    if (!sched_ || !gf) return false;
+    // The scheduler asserts !is_alloc before allocating a new graph, so we
+    // must reset it between graphs. ggml_backend_sched_reset clears the
+    // previous allocation/assignment state and lets the next graph be
+    // allocated and computed.
+    ggml_backend_sched_reset(sched_);
+    if (!ggml_backend_sched_alloc_graph(sched_, gf)) return false;
+    if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Build a ggml_context that owns one block's worth of tensors. Each tensor's
+// `.data` pointer is wired to point into the memory-mapped shard file at the
+// recorded offset.
+//
+// Quantized weights are *aliased* (their data pointer points into the shard
+// mmap, zero-copy) because the dequant path is read-only. F32 weights are
+// copied into a per-block host buffer so the kernel can overwrite them if
+// needed. The returned context owns the F32 copies and the tensor metadata.
+// ---------------------------------------------------------------------------
 struct ggml_context* remora_build_block_ctx(
     const void* shard_base,
     std::size_t shard_size,
     const LayerDesc& desc)
 {
-    // We need enough room for the tensor metadata: ~ sizeof(ggml_tensor)
-    // per tensor, plus workspace. 64 KiB is comfortable for ~10 tensors.
+    // Enough room for tensor metadata: ~ sizeof(ggml_tensor) per tensor.
     constexpr std::size_t kMetaBytes = 64 * 1024;
     struct ggml_init_params p = { .mem_size = kMetaBytes,
                                    .mem_buffer = nullptr,
@@ -94,8 +171,6 @@ struct ggml_context* remora_build_block_ctx(
     if (!ctx) return nullptr;
 
     // First pass: create every tensor with the right shape + dtype.
-    // We can't allocate data yet because we'll need to overwrite the
-    // data pointer for quantized tensors. So just record names.
     for (const TensorDesc& td : desc.tensors) {
         if (td.shape.empty()) continue;
         ggml_type t = remora_dtype_from_string(td.dtype);
@@ -105,9 +180,6 @@ struct ggml_context* remora_build_block_ctx(
                 td.dtype.c_str(), td.name.c_str());
             continue;
         }
-        // ggml_new_tensor takes an int64_t array of sizes, with the
-        // innermost dimension first. Our sidecar shape follows numpy /
-        // gguf convention, which already does this.
         int n_dims = static_cast<int>(td.shape.size());
         std::vector<int64_t> ne(td.shape.begin(), td.shape.end());
         ggml_tensor* t_tensor = ggml_new_tensor(ctx, t, n_dims, ne.data());
@@ -116,31 +188,28 @@ struct ggml_context* remora_build_block_ctx(
                 "[remora] ggml_new_tensor failed for '%s'\n", td.name.c_str());
             continue;
         }
-        // Name the tensor so graph debugging works.
-        ggml_set_name(t_tensor, td.name.c_str());
+        std::string short_name = strip_blk_prefix(td.name);
+        ggml_set_name(t_tensor, short_name.c_str());
     }
 
-    // Allocate data buffers via the CPU backend.
+    // For each tensor, point its data at the shard at the recorded offset.
+    // Quantized: alias (zero-copy). F32: copy so it's self-contained.
+    // (We allocate a CPU host buffer for the F32 copies via a temporary
+    //  backend; the metadata tensors use the same no_alloc ctx.)
     ggml_backend_t cpu =
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu) {
-        std::fprintf(stderr,
-            "[remora] failed to init CPU backend (no libggml-cpu?)\n");
+        std::fprintf(stderr, "[remora] failed to init CPU backend\n");
         ggml_free(ctx);
         return nullptr;
     }
-    ggml_backend_buffer_type_t buft =
-        ggml_backend_get_default_buffer_type(cpu);
-    ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(cpu);
+    ggml_backend_alloc_ctx_tensors_from_buft(ctx, cpu_buft);
 
-    // For each tensor, point its data at the shard at the recorded offset.
-    // For F32 tensors we *copy* because the network will overwrite them
-    // during forward pass. For quantized tensors we *alias* (the dequant
-    // path is read-only) so we don't pay 16+ MB of allocation per block.
     for (const TensorDesc& td : desc.tensors) {
         if (td.shape.empty()) continue;
-        // Find the named tensor in the context.
-        ggml_tensor* t_tensor = ggml_get_tensor(ctx, td.name.c_str());
+        std::string short_name = strip_blk_prefix(td.name);
+        ggml_tensor* t_tensor = ggml_get_tensor(ctx, short_name.c_str());
         if (!t_tensor) continue;
 
         const std::size_t want = ggml_nbytes(t_tensor);
@@ -181,49 +250,33 @@ namespace {
 // Apply a 1D causal convolution with kernel size d_conv. The conv has
 // weights of shape (d_conv, d_inner) and bias of shape (d_inner,). We
 // maintain a (d_conv-1, d_inner) history buffer passed in via `conv_hist`.
-//
-// This is a single-token forward; for a sequence, the caller loops over
-// tokens and updates conv_hist in place.
-struct ggml_tensor* mamba_conv1d(
-        struct ggml_context* ctx,
-        struct ggml_tensor* x,           // [d_inner], current token input
-        struct ggml_tensor* weight,      // [d_conv, d_inner]
-        struct ggml_tensor* bias,        // [d_inner]
-        float* conv_hist)                // [(d_conv-1) * d_inner] scratch
+// `out` is a pre-allocated [d_inner] buffer that the result is written into.
+void mamba_conv1d(
+        struct ggml_tensor* out,          // [d_inner] pre-allocated output
+        struct ggml_tensor* x,            // [d_inner], current token input
+        struct ggml_tensor* weight,       // [d_conv, d_inner]
+        struct ggml_tensor* bias,         // [d_inner]
+        float* conv_hist)                 // [(d_conv-1) * d_inner] scratch
 {
-    // y[i] = bias[i] + sum_{k=0..d_conv-1} weight[k, i] * input[k, i]
-    //   where input[d_conv-1] = x (current) and input[k<d_conv-1] = conv_hist[k]
-    //
-    // For d_conv = 4: y = bias + W[0]*hist[0] + W[1]*hist[1] + W[2]*hist[2] + W[3]*x
-    //
-    // We implement this as a per-channel loop (d_inner = 4096 here, very
-    // small) and produce a ggml_tensor for the result.
-
     const int64_t d_inner = x->ne[0];
-    const int64_t d_conv  = weight->ne[1];
+    const int64_t d_conv  = weight->ne[0];   // shape [d_conv, d_inner]
     const float* W = static_cast<const float*>(weight->data);
     const float* B = static_cast<const float*>(bias->data);
     const float* X = static_cast<const float*>(x->data);
 
-    auto* out = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
     float* Y = static_cast<float*>(out->data);
     for (int64_t i = 0; i < d_inner; ++i) {
         float y = B[i];
-        // k = 0..d_conv-2 reads from history
         for (int64_t k = 0; k < d_conv - 1; ++k) {
             y += W[k * d_inner + i] * conv_hist[k * d_inner + i];
         }
-        // k = d_conv-1 reads from current input
         y += W[(d_conv - 1) * d_inner + i] * X[i];
         Y[i] = y;
     }
-    return out;
 }
 
 // Update the conv history: shift left by one (drop oldest), append x.
 void mamba_conv_shift(float* conv_hist, const float* x, int64_t d_inner, int64_t d_conv) {
-    // hist is (d_conv-1, d_inner) row-major; hist[k] = input at t - (d_conv-1-k)
-    // After this step: new hist[0] = old hist[1], ..., new hist[d_conv-2] = x
     for (int64_t k = 0; k < d_conv - 2; ++k) {
         std::memcpy(conv_hist + k * d_inner,
                     conv_hist + (k + 1) * d_inner,
@@ -237,17 +290,15 @@ std::size_t run_mamba_block(
         RuntimeContext& ctx,
         const LayerDesc& desc,
         const void* shard_base,
-        std::size_t shard_size)
+        std::size_t shard_size,
+        ComputeEngine& engine)
 {
     ggml_context* blk_ctx = remora_build_block_ctx(shard_base, shard_size, desc);
     if (!blk_ctx) return 0;
 
-    ggml_backend_t cpu =
-        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(cpu);
-
-    // Allocate activations: a working context big enough for ~10 tensors.
-    constexpr std::size_t kActBytes = 4 * 1024 * 1024;
+    // Allocate activation tensors in one no_alloc context; the ComputeEngine
+    // scheduler allocates the actual compute buffers on first graph run.
+    constexpr std::size_t kActBytes = 8 * 1024 * 1024;
     struct ggml_init_params ap = { .mem_size = kActBytes,
                                    .mem_buffer = nullptr,
                                    .no_alloc = true };
@@ -268,7 +319,7 @@ std::size_t run_mamba_block(
         !b_dt_proj || !w_ssm_x || !ssm_a || !ssm_d || !w_out_proj) {
         std::fprintf(stderr,
             "[remora] missing required tensors in block %d\n", desc.block_id);
-        ggml_free(act); ggml_free(blk_ctx); ggml_backend_free(cpu);
+        ggml_free(act); ggml_free(blk_ctx);
         return 0;
     }
 
@@ -278,7 +329,11 @@ std::size_t run_mamba_block(
     const int64_t d_conv  = ctx.cfg.d_conv;
     const int64_t dt_rank = ctx.cfg.dt_rank;
 
-    // 1. Build activations and copy in the residual stream.
+    // Activation tensors. All created in a no_alloc context, then allocated
+    // from the engine's CPU buffer type so every tensor has a valid host
+    // `->data` pointer. The forward pass reads/writes these directly (the
+    // hand-rolled conv1d / scan / silu loops and memcpy staging), so they
+    // must be host-visible.
     ggml_tensor* y_norm = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_model);
     ggml_tensor* xz     = ggml_new_tensor_1d(act, GGML_TYPE_F32, 2 * d_inner);
     ggml_tensor* x_pre  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
@@ -294,11 +349,19 @@ std::size_t run_mamba_block(
     ggml_tensor* y_gated= ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
     ggml_tensor* y_out  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_model);
 
-    ggml_backend_alloc_ctx_tensors_from_buft(act, buft);
+    if (!ggml_backend_alloc_ctx_tensors_from_buft(act, engine.buft())) {
+        std::fprintf(stderr,
+            "[remora] failed to allocate activation tensors (block %d)\n",
+            desc.block_id);
+        ggml_free(act); ggml_free(blk_ctx);
+        return 0;
+    }
+
+    // Copy the residual stream into y_norm. y_norm now has a valid host
+    // `->data` (allocated from the CPU buft above).
     std::memcpy(y_norm->data, ctx.hidden_state.data(), d_model * sizeof(float));
 
-    // 2. RMSNorm (manual; ggml_rms_norm adds eps+scale under the hood but
-    //    we have a learned weight, so build it explicitly).
+    // 1. RMSNorm.
     {
         const float eps = 1e-5f;
         const float* x = static_cast<const float*>(y_norm->data);
@@ -311,19 +374,13 @@ std::size_t run_mamba_block(
         for (int64_t i = 0; i < d_model; ++i) y[i] = (x[i] * inv_rms) * w[i];
     }
 
-    // 3. in_proj: xz = ssm_in @ y_norm -> [2*d_inner].
+    // 2. in_proj: xz = ssm_in @ y_norm -> [2*d_inner].
     {
         ggml_tensor* in_xz = ggml_mul_mat(act, w_in_proj, y_norm);
         ggml_cgraph* gf = ggml_new_graph(act);
         ggml_build_forward_expand(gf, in_xz);
-        ggml_backend_t backends[] = { cpu };
-        ggml_backend_buffer_type_t bufts[] = { buft };
-        ggml_backend_sched_t sched =
-            ggml_backend_sched_new(backends, bufts, 1, 4096 * 4096, false, false);
-        ggml_backend_sched_alloc_graph(sched, gf);
-        ggml_backend_sched_graph_compute(sched, gf);
+        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
         std::memcpy(xz->data, in_xz->data, 2 * d_inner * sizeof(float));
-        ggml_backend_sched_free(sched);
     }
 
     // Split xz into x and z.
@@ -335,18 +392,17 @@ std::size_t run_mamba_block(
         std::memcpy(z_out, X + d_inner, d_inner * sizeof(float));
     }
 
-    // 4. causal conv1d on x.
+    // 3. causal conv1d on x.
     {
         float* hist = ctx.conv_state.data() +
                       desc.block_id * (d_conv - 1) * d_inner;
-        ggml_tensor* xc = mamba_conv1d(act, x_pre, w_conv1d, b_conv1d, hist);
-        std::memcpy(x_conv->data, xc->data, d_inner * sizeof(float));
+        mamba_conv1d(x_conv, x_pre, w_conv1d, b_conv1d, hist);
         mamba_conv_shift(hist,
                          static_cast<const float*>(x_pre->data),
                          d_inner, d_conv);
     }
 
-    // 5. silu(x_conv) -> x_act.
+    // 4. silu(x_conv) -> x_act.
     {
         const float* x = static_cast<const float*>(x_conv->data);
         float* y = static_cast<float*>(x_act->data);
@@ -355,24 +411,14 @@ std::size_t run_mamba_block(
         }
     }
 
-    // 6. ssm_x @ x_act -> [dt_rank + 2*d_state], then dt_proj -> dt.
+    // 5. ssm_x @ x_act -> x_db [dt_rank + 2*d_state]; split into dt/B/C.
     {
         ggml_tensor* xbc = ggml_mul_mat(act, w_ssm_x, x_act);
-        ggml_tensor* dt_proj = ggml_mul_mat(act, w_dt_proj, x_act);
-        ggml_tensor* dt_sp = ggml_softplus(act, dt_proj);
         ggml_cgraph* gf = ggml_new_graph(act);
         ggml_build_forward_expand(gf, xbc);
-        ggml_build_forward_expand(gf, dt_sp);
-        ggml_backend_t backends[] = { cpu };
-        ggml_backend_buffer_type_t bufts[] = { buft };
-        ggml_backend_sched_t sched =
-            ggml_backend_sched_new(backends, bufts, 1, 4096 * 4096, false, false);
-        ggml_backend_sched_alloc_graph(sched, gf);
-        ggml_backend_sched_graph_compute(sched, gf);
+        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
         std::memcpy(x_dtbc->data, xbc->data,
                     (dt_rank + 2*d_state) * sizeof(float));
-        std::memcpy(dt_soft->data, dt_sp->data, d_inner * sizeof(float));
-        ggml_backend_sched_free(sched);
     }
     {
         const float* X = static_cast<const float*>(x_dtbc->data);
@@ -384,20 +430,18 @@ std::size_t run_mamba_block(
         std::memcpy(c_out, X + dt_rank + d_state, d_state * sizeof(float));
     }
 
+    // 6. dt_proj: dt = ssm_dt @ dt_pre + ssm_dt_b; softplus -> [d_inner].
+    {
+        ggml_tensor* dt_lin = ggml_mul_mat(act, w_dt_proj, dt_pre);
+        ggml_tensor* dt_bias = ggml_add(act, dt_lin, b_dt_proj);
+        ggml_tensor* dt_sp = ggml_softplus(act, dt_bias);
+        ggml_cgraph* gf = ggml_new_graph(act);
+        ggml_build_forward_expand(gf, dt_sp);
+        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
+        std::memcpy(dt_soft->data, dt_sp->data, d_inner * sizeof(float));
+    }
+
     // 7. Selective scan (one step).
-    //
-    // For each inner channel i (d_inner = 4096 of them, all parallel in time):
-    //   A = -exp(ssm_a[:, i])   (shape [d_state])
-    //   dt = dt_soft[i]         (scalar)
-    //   B = B_pre               (shape [d_state])
-    //   C = C_pre               (shape [d_state])
-    //   A_bar = exp(dt * A)
-    //   B_bar = dt * B
-    //   h[:, i] = A_bar * h[:, i] + outer(B_bar, x_act[i])
-    //   y_ssm[i] = dot(C, h[:, i]) + ssm_d[i] * x_act[i]
-    //
-    // State h has shape (d_state, d_inner). We keep it across tokens in
-    // ctx.ssm_state.
     {
         const float* a_in  = static_cast<const float*>(ssm_a->data);   // [d_state, d_inner]
         const float* d_in  = static_cast<const float*>(ssm_d->data);   // [d_inner]
@@ -412,7 +456,7 @@ std::size_t run_mamba_block(
         for (int64_t i = 0; i < d_inner; ++i) {
             float yi = d_in[i] * x_in[i];
             for (int64_t s = 0; s < d_state; ++s) {
-                const float a_neg = -a_in[s * d_inner + i];   // -A_log[i, s] in canonical Mamba
+                const float a_neg = -a_in[s * d_inner + i];
                 const float A_bar = std::exp(dt[i] * a_neg);
                 const float B_bar = dt[i] * b_in[s];
                 const float h_new = A_bar * h[s * d_inner + i] +
@@ -440,14 +484,8 @@ std::size_t run_mamba_block(
         ggml_tensor* yo = ggml_mul_mat(act, w_out_proj, y_gated);
         ggml_cgraph* gf = ggml_new_graph(act);
         ggml_build_forward_expand(gf, yo);
-        ggml_backend_t backends[] = { cpu };
-        ggml_backend_buffer_type_t bufts[] = { buft };
-        ggml_backend_sched_t sched =
-            ggml_backend_sched_new(backends, bufts, 1, 4096 * 4096, false, false);
-        ggml_backend_sched_alloc_graph(sched, gf);
-        ggml_backend_sched_graph_compute(sched, gf);
+        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
         std::memcpy(y_out->data, yo->data, d_model * sizeof(float));
-        ggml_backend_sched_free(sched);
     }
 
     // 10. Residual: hidden_state += y_out.
@@ -459,19 +497,157 @@ std::size_t run_mamba_block(
 
     ggml_free(act);
     ggml_free(blk_ctx);
-    ggml_backend_free(cpu);
 
     return shard_size;
 }
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// GlobalContext: embeddings, output norm, lm_head.
+// ---------------------------------------------------------------------------
+
+int64_t GlobalContext::tensor_offset(const std::string& name) const {
+    if (!desc) return -1;
+    for (const auto& td : desc->tensors) {
+        if (td.name == name) return static_cast<int64_t>(td.offset);
+    }
+    return -1;
+}
+
+std::string GlobalContext::tensor_dtype(const std::string& name) const {
+    if (!desc) return {};
+    for (const auto& td : desc->tensors) {
+        if (td.name == name) return td.dtype;
+    }
+    return {};
+}
+
+bool GlobalContext::embed(RuntimeContext& ctx, int32_t id,
+                          ComputeEngine& engine) const {
+    const int64_t off = tensor_offset("token_embd.weight");
+    if (off < 0) {
+        std::fprintf(stderr, "[remora] global.bin has no token_embd.weight\n");
+        return false;
+    }
+    ggml_type t = remora_dtype_from_string(tensor_dtype("token_embd.weight"));
+    if (t == GGML_TYPE_COUNT) return false;
+
+    const int64_t d_model = cfg.d_model;
+    const int64_t n_vocab = cfg.vocab_size;
+
+    // Weight context: aliases token_embd.weight into global.bin (read-only
+    // dequant path for quantized embeddings — no copy).
+    struct ggml_init_params wp = {
+        .mem_size = 64 * 1024, .mem_buffer = nullptr, .no_alloc = true };
+    struct ggml_context* wctx = ggml_init(wp);
+    if (!wctx) return false;
+    ggml_tensor* w = ggml_new_tensor_2d(wctx, t, d_model, n_vocab);
+    ggml_set_name(w, "token_embd.weight");
+    w->data = const_cast<void*>(
+        static_cast<const void*>(static_cast<const char*>(base) + off));
+
+    // Activation context for the tiny extraction graph.
+    struct ggml_init_params ap = {
+        .mem_size = 1 << 20, .mem_buffer = nullptr, .no_alloc = true };
+    struct ggml_context* act = ggml_init(ap);
+    if (!act) { ggml_free(wctx); return false; }
+
+    // ids is a leaf tensor we fill directly, so it must have a host pointer.
+    ggml_tensor* ids = ggml_new_tensor_1d(act, GGML_TYPE_I32, 1);
+    if (!ggml_backend_alloc_ctx_tensors_from_buft(act, engine.buft())) {
+        std::fprintf(stderr, "[remora] embed: failed to allocate ids tensor\n");
+        ggml_free(act); ggml_free(wctx);
+        return false;
+    }
+    static_cast<int32_t*>(ids->data)[0] = id;
+
+    ggml_tensor* emb = ggml_get_rows(act, w, ids);  // [d_model]
+    ggml_cgraph* gf = ggml_new_graph(act);
+    ggml_build_forward_expand(gf, emb);
+
+    if (!engine.compute(gf)) { ggml_free(act); ggml_free(wctx); return false; }
+    ggml_backend_tensor_get(emb, ctx.hidden_state.data(), 0, d_model * sizeof(float));
+
+    ggml_free(act);
+    ggml_free(wctx);
+    return true;
+}
+
+bool GlobalContext::compute_logits(RuntimeContext& ctx,
+                                   std::vector<float>& logits,
+                                   ComputeEngine& engine) const {
+    const int64_t off_head = tensor_offset("token_embd.weight");
+    const int64_t off_norm = tensor_offset("output_norm.weight");
+    if (off_head < 0 || off_norm < 0) {
+        std::fprintf(stderr,
+            "[remora] global.bin missing token_embd.weight or output_norm.weight\n");
+        return false;
+    }
+    ggml_type th = remora_dtype_from_string(tensor_dtype("token_embd.weight"));
+    if (th == GGML_TYPE_COUNT) return false;
+
+    const int64_t d_model = cfg.d_model;
+    const int64_t n_vocab = cfg.vocab_size;
+
+    // 1. Final RMSNorm with output_norm.weight.
+    const float eps = 1e-5f;
+    const float* wn = static_cast<const float*>(
+        static_cast<const void*>(static_cast<const char*>(base) + off_norm));
+    const float* x = ctx.hidden_state.data();
+    std::vector<float> normed(d_model);
+    float mean_sq = 0.0f;
+    for (int64_t i = 0; i < d_model; ++i) mean_sq += x[i] * x[i];
+    mean_sq /= d_model;
+    const float inv_rms = 1.0f / std::sqrt(mean_sq + eps);
+    for (int64_t i = 0; i < d_model; ++i) normed[i] = x[i] * inv_rms * wn[i];
+
+    // 2. lm_head = tied token_embd.weight, aliased into global.bin.
+    struct ggml_init_params wp = {
+        .mem_size = 64 * 1024, .mem_buffer = nullptr, .no_alloc = true };
+    struct ggml_context* wctx = ggml_init(wp);
+    if (!wctx) return false;
+    ggml_tensor* w = ggml_new_tensor_2d(wctx, th, d_model, n_vocab);
+    ggml_set_name(w, "token_embd.weight");
+    w->data = const_cast<void*>(
+        static_cast<const void*>(static_cast<const char*>(base) + off_head));
+
+    // 3. logits = lm_head @ normed  ->  [n_vocab]
+    struct ggml_init_params ap = {
+        .mem_size = 4 << 20, .mem_buffer = nullptr, .no_alloc = true };
+    struct ggml_context* act = ggml_init(ap);
+    if (!act) { ggml_free(wctx); return false; }
+
+    // hv is a leaf tensor we fill directly, so it must have a host pointer.
+    ggml_tensor* hv = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_model);
+    if (!ggml_backend_alloc_ctx_tensors_from_buft(act, engine.buft())) {
+        std::fprintf(stderr, "[remora] compute_logits: failed to allocate hv\n");
+        ggml_free(act); ggml_free(wctx);
+        return false;
+    }
+    std::memcpy(hv->data, normed.data(), d_model * sizeof(float));
+
+    ggml_tensor* lg = ggml_mul_mat(act, w, hv);  // [n_vocab]
+    ggml_cgraph* gf = ggml_new_graph(act);
+    ggml_build_forward_expand(gf, lg);
+
+    if (!engine.compute(gf)) { ggml_free(act); ggml_free(wctx); return false; }
+
+    logits.resize(n_vocab);
+    ggml_backend_tensor_get(lg, logits.data(), 0, n_vocab * sizeof(float));
+
+    ggml_free(act);
+    ggml_free(wctx);
+    return true;
+}
+
 // Public dispatch.
-std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer) {
+std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer,
+                              ComputeEngine& engine) {
     if (!layer.desc) return 0;
     // For now we only handle the Mamba architecture.
     return run_mamba_block(ctx, *layer.desc,
-                           layer.weights_base, layer.weights_size);
+                           layer.weights_base, layer.weights_size, engine);
 }
 
 #endif  // REMORA_HAVE_GGML

@@ -22,11 +22,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -46,7 +48,7 @@ void print_usage(const char* prog) {
         "\n"
         "Usage:\n"
         "  %s --layers <dir> [--prompt <text>] [--tokens N]\n"
-        "                       [--temperature T] [--routing <f>]\n"
+        "                       [--temperature T] [--buffer-layers N] [--routing <f>]\n"
         "\n"
         "Options:\n"
         "  --layers <dir>    Directory containing sharded layer files\n"
@@ -54,7 +56,10 @@ void print_usage(const char* prog) {
         "  --prompt <text>   Prompt text to feed the model.\n"
         "                    Default: \"Hello, my name is\"\n"
         "  --tokens  <N>     Tokens to generate after the prompt (default 32).\n"
-        "  --temperature T   Sampling temperature, 0 = greedy (default 0).\n"
+        "  --temperature T   Sampling temperature, 0 = greedy (default 0.7).\n"
+        "  --buffer-layers N Layers to keep mmap'd ahead of the running layer\n"
+        "                    as streaming lookahead. Only the running layer + N\n"
+        "                    are resident at any moment. Default: 1.\n"
         "  --routing <f>     Routing table (unused by the ggml kernel; kept\n"
         "                    for back-compat with the placeholder CLI).\n",
         prog);
@@ -331,8 +336,13 @@ bool load_manifest(const std::string& path, JsonManifest& out) {
     auto read_bool = [&](const std::string& k, bool& v) {
         JsonReader rr(text);
         if (!rr.find_key(k)) return;
+        rr.skip_ws();
+        if (rr.pos() + 4 <= rr.str().size() &&
+            rr.str().compare(rr.pos(), 4, "true") == 0) { v = true; return; }
+        if (rr.pos() + 5 <= rr.str().size() &&
+            rr.str().compare(rr.pos(), 5, "false") == 0) { v = false; return; }
         std::string n; rr.parse_number(n);
-        v = (n == "true");
+        v = (n == "1");
     };
 
     read_str("architecture", out.architecture);
@@ -467,9 +477,8 @@ int main(int argc, char** argv) {
     const std::string prompt_text = arg_value(argc, argv, "--prompt");
     const std::string routing     = arg_value(argc, argv, "--routing");
     const int n_predict           = std::atoi(arg_value(argc, argv, "--tokens").c_str());
-    // --temperature is parsed for CLI compatibility but not yet wired up to
-    // a sampler (sampling is currently stubbed).
-    (void)std::atof(arg_value(argc, argv, "--temperature").c_str());
+    const double temperature      = std::atof(arg_value(argc, argv, "--temperature").c_str());
+    const int buffer_layers       = std::atoi(arg_value(argc, argv, "--buffer-layers").c_str());
 
     if (layers_dir.empty()) {
         std::fprintf(stderr, "[remora] --layers <dir> is required\n\n");
@@ -570,7 +579,7 @@ int main(int argc, char** argv) {
         layer_paths.push_back(std::move(p));
     }
 
-    remora::LayerStreamer streamer(/*buffer_capacity=*/1u << 20);
+    remora::LayerStreamer streamer(buffer_layers);
     streamer.set_layer_paths(layer_paths);
     if (!streamer.start()) {
         std::fprintf(stderr, "[remora] failed to start layer streamer\n");
@@ -618,57 +627,134 @@ int main(int argc, char** argv) {
     std::printf("[remora] prompt (%zu tokens): %s\n",
                 prompt_ids.size(), text.c_str());
 
-    // We currently implement a single-token forward at a time. The
-    // sharded kernel reads its input from ctx.hidden_state. For multi-
-    // token prefill we run the full stack once per token (the residual
-    // state persists in ctx.hidden_state). This is the slow path; the
-    // ggml backend scheduler reuses buffers per token so it's not
-    // catastrophic.
+    // ---- Load global.bin (embeddings + output norm, aliased into mmap) ----
+    std::string global_path = layers_dir + "/global.bin";
+    remora::MappedFile global_file;
+    if (!global_file.open(global_path)) {
+        std::fprintf(stderr, "[remora] failed to mmap %s\n", global_path.c_str());
+        return 1;
+    }
+    remora::LayerDesc global_desc;
+    {
+        JsonSidecar sc;
+        std::string meta = global_path + ".meta.json";
+        if (!load_sidecar(meta, sc)) {
+            std::fprintf(stderr, "[remora] failed to parse %s\n", meta.c_str());
+            return 1;
+        }
+        global_desc.block_id = -1;
+        for (const auto& t : sc.tensors) {
+            remora::TensorDesc td;
+            td.name  = t.name;
+            td.shape = t.shape;
+            td.dtype = t.dtype;
+            td.offset = t.offset;
+            td.size   = t.size;
+            global_desc.tensors.push_back(std::move(td));
+        }
+    }
+    remora::GlobalContext gctx;
+    gctx.cfg  = ctx.cfg;
+    gctx.base = global_file.data();
+    gctx.size = global_file.size();
+    gctx.desc = &global_desc;
+
+    // We implement a single-token forward at a time. The sharded kernel
+    // reads its input from ctx.hidden_state; the streamer is reset and
+    // re-swept for every token so the sliding window stays bounded.
+    //
+    // One persistent ComputeEngine backs every layer and every token: it
+    // owns a single GPU-first ggml backend list + scheduler, so the layer
+    // matmuls reuse the same buffers instead of re-init'ing a backend per
+    // call (the previous design, which was pathologically slow).
+    remora::ComputeEngine engine;
+    if (!engine.ok()) {
+        std::fprintf(stderr, "[remora] failed to init compute engine\n");
+        return 1;
+    }
+    std::fprintf(stderr, "[remora] compute engine ready (primary backend: %s)\n",
+                 engine.primary_backend_name());
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Prefill: run prompt tokens.
+    // ---- Prefill: run prompt tokens, updating recurrent state ------------
     for (int32_t tok : prompt_ids) {
-        // Look up embedding row [d_model] and put it into hidden_state.
-        // For now: zeros (we don't have the embedding table wired up to
-        // ggml yet — that's the next step). The kernel will still run
-        // and produce a finite residual stream from zero input, which is
-        // useful for verifying timing + memory without correct numerics.
-        std::fill(ctx.hidden_state.begin(), ctx.hidden_state.end(), 0.0f);
-        (void)tok;
+        // Embed the token into hidden_state (residual stream).
+        if (!gctx.embed(ctx, tok, engine)) return 1;
 
-        // Run every block on the current hidden_state.
+        if (!streamer.reset()) {
+            std::fprintf(stderr, "[remora] failed to reset streamer\n");
+            return 1;
+        }
         do {
             const remora::LayerBuffer& buf = streamer.active();
             remora::LayerContext layer;
             layer.weights_base  = buf.data;
             layer.weights_size  = buf.size;
             layer.desc          = &descs[streamer.current_index()];
-            run_layer_forward(ctx, layer);
+            run_layer_forward(ctx, layer, engine);
         } while (streamer.advance());
+        ctx.step++;
     }
 
-    // Now generate `n_predict` more tokens.
+    // ---- Generate `n_predict` more tokens --------------------------------
     int32_t last_tok = prompt_ids.back();
     std::string generated;
     auto t_first = std::chrono::steady_clock::time_point{};
     bool first_tok_recorded = false;
+    std::vector<float> logits;
     for (int step = 0; step < n_predict; ++step) {
-        std::fill(ctx.hidden_state.begin(), ctx.hidden_state.end(), 0.0f);
-        (void)last_tok;
+        // Embed the previous token into hidden_state.
+        if (!gctx.embed(ctx, last_tok, engine)) return 1;
 
+        if (!streamer.reset()) {
+            std::fprintf(stderr, "[remora] failed to reset streamer\n");
+            return 1;
+        }
         do {
             const remora::LayerBuffer& buf = streamer.active();
             remora::LayerContext layer;
             layer.weights_base  = buf.data;
             layer.weights_size  = buf.size;
             layer.desc          = &descs[streamer.current_index()];
-            run_layer_forward(ctx, layer);
+            run_layer_forward(ctx, layer, engine);
         } while (streamer.advance());
 
-        // Real sampling (argmax over the lm_head) is not wired up here —
-        // we just emit a placeholder token-id so the timing is meaningful.
-        last_tok = 0;  // stub
+        // Final RMSNorm + lm_head -> logits.
+        if (!gctx.compute_logits(ctx, logits, engine)) return 1;
+        ctx.step++;
+
+        // Sample the next token.
+        if (temperature <= 0.0f || cfg.tied_embeddings == false) {
+            // Greedy: argmax.
+            int argmax = 0;
+            for (size_t i = 1; i < logits.size(); ++i) {
+                if (logits[i] > logits[argmax]) argmax = static_cast<int>(i);
+            }
+            last_tok = argmax;
+        } else {
+            // Temperature sampling: softmax over logits/temp, then sample.
+            std::vector<double> probs(logits.size());
+            double max_l = logits[0];
+            for (auto v : logits) max_l = std::max<double>(max_l, v);
+            double sum = 0.0;
+            for (size_t i = 0; i < logits.size(); ++i) {
+                probs[i] = std::exp((logits[i] - max_l) / temperature);
+                sum += probs[i];
+            }
+            for (auto& p : probs) p /= sum;
+            // Simple stochastic sampling via random_device.
+            static std::mt19937_64 rng(std::random_device{}());
+            std::uniform_real_distribution<double> uni(0.0, 1.0);
+            double r = uni(rng);
+            double acc = 0.0;
+            last_tok = static_cast<int>(logits.size() - 1);
+            for (size_t i = 0; i < probs.size(); ++i) {
+                acc += probs[i];
+                if (r <= acc) { last_tok = static_cast<int>(i); break; }
+            }
+        }
+
         std::string piece = tokenizer.decode_token(last_tok);
         generated += piece;
         if (!first_tok_recorded) {

@@ -7,9 +7,15 @@
 
 #ifdef REMORA_HAVE_GGML
 #include <ggml.h>
+#include <ggml-backend.h>
 #endif
 
 namespace remora {
+
+// Forward declaration so run_layer_forward can accept a ComputeEngine& even
+// when REMORA_HAVE_GGML is disabled (the full definition lives under the
+// guard below).
+class ComputeEngine;
 
 // ---------------------------------------------------------------------------
 // Model configuration (parsed from manifest.json).
@@ -88,10 +94,84 @@ struct RuntimeContext {
     int64_t step = 0;
 };
 
+#ifdef REMORA_HAVE_GGML
+
+// ---------------------------------------------------------------------------
+// ComputeEngine: owns a single persistent backend list + scheduler.
+//
+// This is the heart of the performance fix. The previous kernel created a
+// fresh ggml backend and scheduler on *every matmul*, per block, per token
+// — hundreds of expensive backend init / buffer alloc / sched teardown
+// cycles per forward pass. ComputeEngine initializes the backends once
+// (GPU-first: Metal, then CPU, then BLAS) and reuses one `ggml_backend_sched`
+// across every block and every token. The scheduler lazily allocates its
+// compute buffers on first use and reuses them thereafter, so we avoid
+// per-call alloc/free churn and automatically offload matmuls to the GPU
+// when the backend supports it.
+// ---------------------------------------------------------------------------
+class ComputeEngine {
+public:
+    ComputeEngine();
+    ~ComputeEngine();
+
+    ComputeEngine(const ComputeEngine&) = delete;
+    ComputeEngine& operator=(const ComputeEngine&) = delete;
+
+    // True once the backends + scheduler are ready.
+    bool ok() const { return sched_ != nullptr; }
+
+    // Name of the primary (first) backend, e.g. "Metal" / "CPU" / "BLAS".
+    const char* primary_backend_name() const;
+
+    // Run a pre-built forward graph on the persistent scheduler.
+    // Allocates the scheduler's compute buffers on first call, reuses them
+    // on subsequent calls. Returns false on compute failure.
+    bool compute(struct ggml_cgraph* gf);
+
+    // Backend for allocating activation tensors. Falls back to CPU.
+    ggml_backend_t backend() const { return backends_.empty() ? nullptr : backends_.front(); }
+    // Buffer type for activation tensors (default type of `backend()`).
+    ggml_backend_buffer_type_t buft() const { return bufts_.empty() ? nullptr : bufts_.front(); }
+
+private:
+    std::vector<ggml_backend_t> backends_;
+    std::vector<ggml_backend_buffer_type_t> bufts_;
+    ggml_backend_sched_t sched_ = nullptr;
+};
+
+#endif  // REMORA_HAVE_GGML
+
+// ---------------------------------------------------------------------------
+// GlobalContext: the non-repeating tensors (embeddings, output norm, lm_head).
+//
+// The sharder writes these into `global.bin` (with `global.bin.meta.json`
+// sidecar). For a tied-embedding Mamba model the token embedding table is
+// used both as the input embedding AND as the lm_head output matrix.
+// ---------------------------------------------------------------------------
+struct GlobalContext {
+    ModelConfig cfg;
+
+    const void* base = nullptr;         // memory-mapped global.bin base
+    std::size_t size = 0;               // total bytes
+    const LayerDesc* desc = nullptr;    // parsed sidecar (tensor locs)
+
+    // Locate the offset of a tensor by name within global.bin, or -1.
+    int64_t tensor_offset(const std::string& name) const;
+    // Locate the dtype of a tensor by name.
+    std::string tensor_dtype(const std::string& name) const;
+    // Load token `id`'s embedding row [d_model] into ctx.hidden_state.
+    bool embed(RuntimeContext& ctx, int32_t id, ComputeEngine& engine) const;
+    // Final RMSNorm + lm_head: compute logits [vocab] for the current
+    // hidden_state. Returns false on failure.
+    bool compute_logits(RuntimeContext& ctx, std::vector<float>& logits,
+                        ComputeEngine& engine) const;
+};
+
 // Run one block's forward pass over the current hidden_state and update
-// ctx in place. Returns the number of weight bytes consumed (or, in ggml
-// mode, the size of the shard file).
-std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer);
+// ctx in place. Uses `engine` for all ggml compute. Returns the number of
+// weight bytes consumed (or, in ggml mode, the size of the shard file).
+std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer,
+                              ComputeEngine& engine);
 
 #ifdef REMORA_HAVE_GGML
 // ---------------------------------------------------------------------------

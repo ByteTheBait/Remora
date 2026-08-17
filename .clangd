@@ -15,8 +15,9 @@ CompileFlags:
   Add:
     - -std=gnu++20
     - -DREMORA_HAVE_GGML=1
-    - -I/opt/homebrew/Cellar/ggml/0.17.0/include
-    - -isystem/opt/homebrew/Cellar/llama.cpp/10180/include
+    - -I/Users/henry/Developer/Remora/src
+    - -I/opt/homebrew/Cellar/ggml/0.20.1/include
+    - -isystem/opt/homebrew/Cellar/llama.cpp/10450/include
   Remove:
     - -isystem/opt/homebrew/include
 
