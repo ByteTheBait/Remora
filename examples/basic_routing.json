@@ -1,0 +1,8 @@
+{
+  "default": "expert_chat_7b",
+  "rules": [
+    { "task": "code", "expert": "expert_code_7b", "pool": "layers/expert_code_7b" },
+    { "task": "math", "expert": "expert_math_7b", "pool": "layers/expert_math_7b" },
+    { "task": "chat", "expert": "expert_chat_7b", "pool": "layers/expert_chat_7b" }
+  ]
+}

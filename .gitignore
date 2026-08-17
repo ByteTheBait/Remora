@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+
+# Sharded model layers
+layers/
+*.gguf
