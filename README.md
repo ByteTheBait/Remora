@@ -37,7 +37,7 @@ VRAM.
 
 ## Architectural Comparison
 
-| Metric | Traditional Transformer | Your Layer-by-Layer RNN MoE |
+| Metric | Traditional Transformer | Remora Layer-by-Layer RNN MoE |
 | ------ | ----------------------- | --------------------------- |
 | VRAM Consumption | Scales with Sequence Length (O(N)) | Constant / Static (O(1)) |
 | Model Pool Limit | Limited by physical VRAM capacity | Limited only by SSD storage space |
