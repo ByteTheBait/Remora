@@ -101,6 +101,11 @@ ComputeEngine::ComputeEngine() {
     ggml_backend_t cpu =
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (cpu) {
+        // Note: we deliberately do NOT raise the CPU thread count here.
+        // The matmuls are tiny (single-token, [4096,2048]@[2048]), so
+        // thread-sync overhead dominates; the ggml default of 4 threads
+        // measured ~4 tok/s while forcing 8 threads collapsed to ~0.4
+        // tok/s. Leave the backend at its default.
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(cpu);
         if (buft) {
             backends_.push_back(cpu);
