@@ -132,3 +132,43 @@ if(REMORA_HAVE_GGML AND NOT GGML_DIR)
 endif()
 
 install(TARGETS remora RUNTIME DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# remora_llama — libllama-based driver that runs the model from sharded
+# layer files using llama_model_init_from_user + a per-tensor callback.
+# ---------------------------------------------------------------------------
+#
+# We don't build the vendored llama.cpp source — that's expensive and
+# pointless since Homebrew ships libllama at /opt/homebrew/Cellar/llama.cpp/
+# (same version as our vendored copy, b10180). We just consume the public
+# C API through <llama.h> and link against -lllama.
+#
+# pkg-config llama gives us the include path + -lggml -lggml-base -lllama
+# in one place. We require pkg-config to be available AND the Homebrew
+# llama.cpp bottle to be installed. If either is missing, this target is
+# skipped with a warning so the existing `remora` binary still builds.
+# ---------------------------------------------------------------------------
+
+if(PkgConfig_FOUND)
+    pkg_check_modules(LLAMA IMPORTED_TARGET llama)
+endif()
+if(LLAMA_FOUND)
+    message(STATUS "[remora] using system llama.cpp ${LLAMA_VERSION} via pkg-config")
+    add_executable(remora_llama src/main_llama.cpp)
+    # Homebrew's llama.cpp pkg-config is incomplete — it lists -lggml but
+    # doesn't propagate the ggml include path. Add it explicitly so that
+    # <llama.h> can find <ggml.h>.
+    target_include_directories(remora_llama PRIVATE
+        ${LLAMA_INCLUDE_DIRS}
+        ${GGML_INCLUDE_DIRS})
+    target_link_libraries(remora_llama PRIVATE PkgConfig::LLAMA)
+    target_compile_options(remora_llama PRIVATE -Wall -Wextra)
+    set_target_properties(remora_llama PROPERTIES
+        BUILD_RPATH "${LLAMA_LIBRARY_DIRS};${BUILD_RPATH}"
+        INSTALL_RPATH "${LLAMA_LIBRARY_DIRS};${INSTALL_RPATH}")
+    install(TARGETS remora_llama RUNTIME DESTINATION bin)
+else()
+    message(WARNING
+        "[remora] libllama not found via pkg-config. Skipping remora_llama.\n"
+        "         Install Homebrew 'llama.cpp' to enable the libllama driver.")
+endif()
