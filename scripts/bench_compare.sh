@@ -2,9 +2,13 @@
 # scripts/bench_compare.sh
 #
 # Side-by-side benchmark:
-#   * Remora   — runs the layer-by-layer streamer over the sharded GGUF
-#                produced by scripts/shard_gguf.py.
-#   * llama.cpp — runs llama-cli on the same .gguf.
+#   * Remora        — runs the layer-by-layer placeholder streamer over the
+#                      sharded GGUF produced by scripts/shard_gguf.py.
+#   * remora_llama  — runs the libllama-based driver that consumes sharded
+#                      weights via a per-tensor callback. This produces real
+#                      Mamba outputs (no placeholder math) and is the actual
+#                      apples-to-apples comparison vs llama.cpp.
+#   * llama.cpp     — runs llama-cli on the original monolithic .gguf.
 #
 # For each backend the script samples peak RSS (KB) and wall time, derives
 # a TTFT proxy, and prints tokens/sec. Results go to stdout and to
@@ -17,6 +21,7 @@ cd "$(dirname "$0")/.."
 MODEL="${MODEL:-mamba-1.4b-hf.Q4_K_M.gguf}"
 LAYERS_DIR="${LAYERS_DIR:-layers}"
 REMORA_BIN="${REMORA_BIN:-./build/remora}"
+REMORA_LLAMA_BIN="${REMORA_LLAMA_BIN:-./build/remora_llama}"
 ROUTING="${ROUTING:-examples/basic_routing.json}"
 LLAMA_CLI="${LLAMA_CLI:-llama-cli}"
 
@@ -37,24 +42,6 @@ INLINE_PROMPT_TPS=""
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
-# peak_rss_kb PID
-# Returns peak RSS in KB by sampling `ps` until the process exits.
-peak_rss_kb() {
-    local pid="$1"
-    local peak=0
-    while kill -0 "$pid" 2>/dev/null; do
-        # rss is in KB on macOS
-        local rss
-        rss=$(ps -o rss= -p "$pid" 2>/dev/null || echo 0)
-        rss="${rss// /}"
-        if [[ "$rss" =~ ^[0-9]+$ ]] && (( rss > peak )); then
-            peak=$rss
-        fi
-        sleep "$(awk -v hz="$SAMPLE_HZ" 'BEGIN{printf "%.3f", 1.0/hz}')"
-    done
-    echo "$peak"
-}
 
 # rss_samples_log FILE PID
 # Append (timestamp_ms, rss_kb) lines to FILE while PID is alive.
@@ -82,9 +69,9 @@ rss_samples_log() {
 command -v "$LLAMA_CLI" >/dev/null \
     || { echo "missing $LLAMA_CLI on PATH"; exit 1; }
 
-LAYER_COUNT=$(ls "$LAYERS_DIR"/blk.* | wc -l | tr -d ' ')
+LAYER_COUNT=$(ls "$LAYERS_DIR"/blk.* 2>/dev/null | grep -v '\.meta\.json$' | wc -l | tr -d ' ')
 # Total weight bytes across all blk.* files (BSD `du` on macOS has no -b).
-TOTAL_BYTES=$(cat "$LAYERS_DIR"/blk.* | wc -c | tr -d ' ')
+TOTAL_BYTES=$(cat "$LAYERS_DIR"/blk.* 2>/dev/null | wc -c | tr -d ' ')
 
 log "model:       $MODEL"
 log "layers:      $LAYER_COUNT sharded blocks in $LAYERS_DIR"
@@ -126,7 +113,7 @@ REMORA_WALL_MS=$(( (END_NS - START_NS) / 1000000 ))
 
 # Detect first-output timestamp (proxy for TTFT in the placeholder runtime).
 # Remora's first per-layer printf is "   layer 1/N done ...".
-FIRST_OUTPUT_MS=$(awk -v t0="$START_NS" '
+REMORA_FIRST_OUTPUT_MS=$(awk -v t0="$START_NS" '
     /layer 1\// {
         # Convert ms epoch to relative ms.
         cmd = "date +%s%N"; cmd | getline now; close(cmd);
@@ -149,7 +136,7 @@ REMORA_LAYERSPERSEC=$(awk -v n="$LAYER_COUNT" -v ms="$REMORA_WALL_MS" '
     BEGIN{ if (ms <= 0) { print "0.0"; exit } printf "%.2f", n / (ms/1000.0) }')
 
 log "Remora wall:     ${REMORA_WALL_MS} ms"
-log "Remora first-out (TTFT proxy): ${FIRST_OUTPUT_MS:-N/A} ms"
+log "Remora first-out (TTFT proxy): ${REMORA_FIRST_OUTPUT_MS:-N/A} ms"
 log "Remora peak RSS: ${REMORA_PEAK_KB} KB (~$(awk -v k="$REMORA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}') MiB)"
 log "Remora stream:   ${REMORA_STREAM_MBPS} MiB/s"
 log "Remora layers/s: ${REMORA_LAYERSPERSEC} (placeholder kernel, not real TPS)"
@@ -249,6 +236,69 @@ log "llama.cpp peak RSS:${LLAMA_PEAK_KB} KB (~$(awk -v k="$LLAMA_PEAK_KB" 'BEGIN
 echo
 
 # ---------------------------------------------------------------------------
+# Run 3: remora_llama (libllama driver, sharded weights)
+# ---------------------------------------------------------------------------
+
+if [[ -x "$REMORA_LLAMA_BIN" ]]; then
+    log "===== Run 3: remora_llama (libllama + sharded weights) ====="
+    REMORA_LLAMA_LOG="remora_llama.stdout.log"
+    REMORA_LLAMA_RSS="remora_llama.rss.log"
+    : > "$REMORA_LLAMA_LOG"
+    : > "$REMORA_LLAMA_RSS"
+
+    START_NS=$(date +%s%N)
+    DYLD_LIBRARY_PATH="/opt/homebrew/Cellar/llama.cpp/10180/lib:/opt/homebrew/Cellar/ggml/0.17.0/lib" \
+    GGML_BACKEND_PATH="/opt/homebrew/Cellar/ggml/0.17.0/libexec" \
+    "$REMORA_LLAMA_BIN" \
+        --gguf "$MODEL" \
+        --layers "$LAYERS_DIR" \
+        --prompt "$PROMPT" \
+        --tokens "$N_PREDICT" \
+        --ctx "$CTX_SIZE" \
+        > "$REMORA_LLAMA_LOG" 2>&1 &
+    REMORA_LLAMA_PID=$!
+
+    ( rss_samples_log "$REMORA_LLAMA_RSS" "$REMORA_LLAMA_PID" ) &
+    SAMPLER_PID=$!
+
+    wait "$REMORA_LLAMA_PID"
+    REMORA_LLAMA_EXIT=$?
+    wait "$SAMPLER_PID" 2>/dev/null || true
+    END_NS=$(date +%s%N)
+
+    REMORA_LLAMA_WALL_MS=$(( (END_NS - START_NS) / 1000000 ))
+    REMORA_LLAMA_PEAK_KB=$(awk '{print $2}' "$REMORA_LLAMA_RSS" | sort -n | tail -1)
+    REMORA_LLAMA_PEAK_KB=${REMORA_LLAMA_PEAK_KB:-0}
+
+    # remora_llama prints its own timing line:
+    #   remora: %.3fs for %d tokens (%.2f tok/s)
+    REMORA_LLAMA_TIMING=$(grep -E 'remora: [0-9.]+s for [0-9]+ tokens' "$REMORA_LLAMA_LOG" | tail -1 || true)
+    REMORA_LLAMA_TPS=$(echo "$REMORA_LLAMA_TIMING" | sed -nE 's/.*\(([0-9.]+) tok\/s\).*/\1/p' || true)
+    REMORA_LLAMA_TPS=${REMORA_LLAMA_TPS:-N/A}
+
+    # Detect "loaded N tensors" line as a cheap proxy for "first operand ready".
+    REMORA_LLAMA_TTFT_MS=$(awk -v t0="$START_NS" '
+        /remora: indexed [0-9]+ tensors/ {
+            cmd = "date +%s%N"; cmd | getline now; close(cmd);
+            rel_ms = int((now - t0) / 1000000);
+            print rel_ms; exit
+        }' "$REMORA_LLAMA_LOG")
+
+    log "remora_llama wall:    ${REMORA_LLAMA_WALL_MS} ms"
+    log "remora_llama first-out (TTFT px): ${REMORA_LLAMA_TTFT_MS:-N/A} ms"
+    log "remora_llama TPS:     ${REMORA_LLAMA_TPS} tok/s"
+    log "remora_llama peak RSS:${REMORA_LLAMA_PEAK_KB} KB (~$(awk -v k="$REMORA_LLAMA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}') MiB)"
+    echo
+else
+    log "remora_llama binary not built at $REMORA_LLAMA_BIN — skipping Run 3."
+    REMORA_LLAMA_WALL_MS=0
+    REMORA_LLAMA_TPS="n/a"
+    REMORA_LLAMA_PEAK_KB=0
+    REMORA_LLAMA_TTFT_MS=""
+    REMORA_LLAMA_EXIT=0
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -256,32 +306,38 @@ echo
     echo "============================================================"
     echo "Mamba 1.4B Q4_K_M  —  Remora vs llama.cpp"
     echo "============================================================"
-    printf "%-30s | %-22s | %-22s\n" "metric" "Remora" "llama.cpp"
-    echo "------------------------------+------------------------+------------------------"
-    printf "%-30s | %-22s | %-22s\n" "model"        "$MODEL"                   "$MODEL"
-    printf "%-30s | %-22s | %-22s\n" "sharded?"     "yes (${LAYER_COUNT} blocks)" "no (single file)"
-    printf "%-30s | %-22s | %-22s\n" "wall time (ms)"      "$REMORA_WALL_MS"   "$LLAMA_WALL_MS"
-    printf "%-30s | %-22s | %-22s\n" "TTFT (ms)"           "${FIRST_OUTPUT_MS:-N/A}" "$LLAMA_TTFT_MS"
-    printf "%-30s | %-22s | %-22s\n" "tokens generated"    "0 (placeholder)"   "$LLAMA_N_TOK"
-    printf "%-30s | %-22s | %-22s\n" "tokens/sec"          "n/a"               "$LLAMA_TPS"
-    printf "%-30s | %-22s | %-22s\n" "gen tok/s (inline)"  "n/a"               "${INLINE_GEN_TPS:-N/A}"
-    printf "%-30s | %-22s | %-22s\n" "prompt tok/s (inline)" "n/a"             "${INLINE_PROMPT_TPS:-N/A}"
-    printf "%-30s | %-22s | %-22s\n" "layers/sec (proxy)"  "$REMORA_LAYERSPERSEC" "n/a"
-    printf "%-30s | %-22s | %-22s\n" "stream throughput"   "$REMORA_STREAM_MBPS MiB/s" "n/a (mmap-once)"
-    printf "%-30s | %-22s | %-22s\n" "peak RSS (MiB)"      "$(awk -v k="$REMORA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')" \
-                                                                   "$(awk -v k="$LLAMA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')"
-    printf "%-30s | %-22s | %-22s\n" "exit code"           "$REMORA_EXIT"      "$LLAMA_EXIT"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "metric" "Remora" "remora_llama" "llama.cpp"
+    echo "------------------------------+------------------------+------------------------+------------------------"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "model"        "$MODEL"                   "$MODEL"                      "$MODEL"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "sharded?"     "yes (${LAYER_COUNT} blocks)" "yes (${LAYER_COUNT} blocks)" "no (single file)"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "wall time (ms)"      "$REMORA_WALL_MS"   "$REMORA_LLAMA_WALL_MS"  "$LLAMA_WALL_MS"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "TTFT (ms)"           "${REMORA_FIRST_OUTPUT_MS:-N/A}" "${REMORA_LLAMA_TTFT_MS:-N/A}" "$LLAMA_TTFT_MS"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "tokens generated"    "0 (placeholder)"   "$N_PREDICT"               "$LLAMA_N_TOK"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "tokens/sec"          "n/a"               "${REMORA_LLAMA_TPS}"        "$LLAMA_TPS"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "gen tok/s (inline)"  "n/a"               "n/a"                       "${INLINE_GEN_TPS:-N/A}"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "prompt tok/s (inline)" "n/a"             "n/a"                       "${INLINE_PROMPT_TPS:-N/A}"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "layers/sec (proxy)"  "$REMORA_LAYERSPERSEC" "n/a"                       "n/a"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "stream throughput"   "$REMORA_STREAM_MBPS MiB/s" "n/a (loads shards)"   "n/a (mmap-once)"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "peak RSS (MiB)"      "$(awk -v k="$REMORA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')" \
+                                                          "$(awk -v k="$REMORA_LLAMA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')" \
+                                                                                                                                                                                                 "$(awk -v k="$LLAMA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "exit code"           "$REMORA_EXIT"      "$REMORA_LLAMA_EXIT"        "$LLAMA_EXIT"
     echo
     echo "Notes:"
     echo "  * Remora's RNN kernel is currently a placeholder (h = 0.9h + 0.1x over a"
     echo "    64-dim state). It streams real bytes off disk via mmap, but does NOT"
     echo "    run a real Mamba selective scan. 'layers/sec' is a work-rate proxy."
+    echo "  * remora_llama is the libllama-based driver: it produces real Mamba"
+    echo "    outputs from sharded weights via the same llama.cpp numerics and"
+    echo "    sampler as llama-cli. It exists to compare RSS / TTFT / TPS between"
+    echo "    sharded-weight streaming and monolithic llama-cli."
     echo "  * 'TTFT' for Remora is measured as wall time until the first per-layer"
-    echo "    printf; llama.cpp's is (total_ms - eval_ms), which still includes"
-    echo "    prompt processing."
+    echo "    printf; remora_llama's is wall time until 'indexed N tensors' is"
+    echo "    printed (model-graph ready); llama.cpp's is (total_ms - eval_ms),"
+    echo "    which still includes prompt processing."
     echo "  * RSS is sampled from \`ps -o rss=\` at ${SAMPLE_HZ} Hz; peak is the max."
     echo
 } | tee "$OUT_FILE"
 
 log "wrote $OUT_FILE"
-log "raw logs: $REMORA_LOG $LLAMA_LOG  ($REMORA_RSS, $LLAMA_RSS)"
+log "raw logs: $REMORA_LOG $LLAMA_LOG $REMORA_LLAMA_LOG  ($REMORA_RSS, $LLAMA_RSS, $REMORA_LLAMA_RSS)"
