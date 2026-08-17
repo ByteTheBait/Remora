@@ -493,6 +493,40 @@ static void set_tensor_data_cb(struct ggml_tensor* tensor, void* userdata) {
     state->total_tensors += 1;
 }
 
+// Unmap + close every shard we still have in `state.shards`. After all
+// `set_tensor_data_cb` calls have returned, libllama has copied each
+// tensor's bytes into a backend buffer (CPU host pointer or Metal
+// shared pointer); the source mmap is dead weight in our address space.
+// Freeing it is the whole point of sharding — peak RSS drops from
+// ~730 MB resident (the shards) + ~1 GB (backend buffers) down to just
+// the backend buffers.
+//
+// We use `madvise(MADV_DONTNEED)` rather than `munmap` for two reasons:
+//   1. The kernel keeps the VMA alive but drops the resident pages;
+//      a future page fault would re-fault from disk (we don't expect any
+//      unless libllama re-reads weights for some reason).
+//   2. The fd is kept open until `~ShardMmap` runs, so a re-fault is
+//      cheap. We follow up with `munmap` + `close` to release the VMA
+//      and the fd entirely.
+static void release_shards(CallbackState& state) {
+    uint64_t total_released = 0;
+    for (auto& [path, sm] : state.shards) {
+        if (sm.base != nullptr && sm.base != MAP_FAILED) {
+            ::madvise(sm.base, sm.size, MADV_DONTNEED);
+            ::munmap(sm.base, sm.size);
+            total_released += sm.size;
+        }
+        if (sm.fd >= 0) {
+            ::close(sm.fd);
+        }
+        sm.base = nullptr;
+        sm.fd = -1;
+    }
+    state.shards.clear();
+    std::fprintf(stderr, "remora: released %llu MB of shard mmap after load\n",
+                 (unsigned long long) (total_released / (1024 * 1024)));
+}
+
 // ---------------------------------------------------------------------------
 // CLI + main.
 // ---------------------------------------------------------------------------
@@ -583,6 +617,12 @@ int main(int argc, char** argv) try {
                  (unsigned long long) state.total_tensors,
                  (unsigned long long) (state.total_bytes_moved / (1024 * 1024)),
                  state.shards.size());
+
+    // Each weight has now been copied into a backend buffer (CPU host ptr
+    // or Metal shared memory). The source mmaps are dead weight — drop
+    // them so peak RSS reflects the libllama backend, not the shards we
+    // streamed from.
+    release_shards(state);
 
     // 5. Build the context.
     auto cparams = llama_context_default_params();

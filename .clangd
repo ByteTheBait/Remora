@@ -1,24 +1,29 @@
 # clangd configuration for Remora.
 #
-# The project vendors llama.cpp under third_party/llama.cpp/, which in turn
-# vendors its own ggml under third_party/llama.cpp/ggml/. The header search
-# path for *our* sources is therefore the vendored ggml, not Homebrew's.
-# Homebrew's ggml 0.17.0 lacks some types (GGML_ROPE_TYPE_NEOX, etc.) that
-# the vendored header depends on, so pointing clangd at Homebrew's prefix
-# produces spurious "undeclared identifier" errors when it tries to index
-# llama.h.
+# The driver `src/main_llama.cpp` links against the system libllama (b10180)
+# via pkg-config, so it must use the system headers from Homebrew, NOT the
+# vendored ones in third_party/llama.cpp/. The vendored copy differs from
+# the system ABI in subtle ways (GGML_ROPE_TYPE_NEOX flags, sampler API
+# names, etc.) — pointing clangd at the vendored headers produces spurious
+# "undeclared identifier" errors when indexinig llama.h.
+#
+# We match the build command exactly: -isystem for the Homebrew include
+# paths so they outrank any framework defaults, and quiet the unused-header
+# diagnostics clangd otherwise emits for every stdlib header we include.
 
 CompileFlags:
   Add:
-    - -std=c++20
+    - -std=gnu++20
     - -DREMORA_HAVE_GGML=1
-    - -I/Users/henry/Developer/Remora/third_party/llama.cpp/ggml/include
-    - -I/Users/henry/Developer/Remora/third_party/llama.cpp/include
-    - -I/Users/henry/Developer/Remora/third_party/llama.cpp/common
     - -I/opt/homebrew/Cellar/ggml/0.17.0/include
+    - -isystem/opt/homebrew/Cellar/llama.cpp/10180/include
+  Remove:
+    - -isystem/opt/homebrew/include
 
 Index:
   Background: Build
 
 Diagnostics:
   UnusedIncludes: None
+  Suppress:
+    - -Wunused-include
