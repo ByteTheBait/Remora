@@ -2,9 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace remora {
@@ -67,41 +65,60 @@ private:
 #endif
 };
 
-// Double-buffered asynchronous layer loader.
+// True sliding-window layer streamer.
 //
-// Two VRAM/CPU buffers (A and B) are alternated so that while the compute
-// engine runs a forward pass on buffer A, the I/O layer streams the next
-// layer into buffer B. This hides disk latency behind compute.
+// Only `buffer_layers + 1` layers are memory-mapped at any moment: the
+// layer currently being computed plus the next `buffer_layers` layers as
+// lookahead (hiding disk latency). As the running layer finishes it is
+// immediately unmapped and the layer `buffer_layers` positions ahead is
+// streamed in. This keeps peak RSS bounded to ~(buffer_layers + 1) layer
+// shards regardless of model depth.
+//
+//   --buffer-layers 0  : only the running layer is resident
+//   --buffer-layers 1  : running + 1 lookahead (default)
+//   --buffer-layers N  : running + N lookahead
 class LayerStreamer {
 public:
-    explicit LayerStreamer(std::size_t buffer_capacity);
+    explicit LayerStreamer(int buffer_layers);
     ~LayerStreamer();
 
     // Register the ordered list of layer files to stream.
     void set_layer_paths(std::vector<std::string> paths);
 
-    // Begin streaming the first layer into the active buffer.
+    // Begin streaming: map the first layer and the next buffer_layers.
     bool start();
 
-    // Advance to the next layer. The buffer that was just consumed is
-    // immediately reused for the following layer's read.
+    // Advance the running layer by one. Unmaps the layer that just
+    // finished and streams in the next lookahead layer.
     // Returns false when there are no more layers.
     bool advance();
 
+    // Reset the streamer back to the first layer so a fresh forward pass
+    // can sweep all layers again. Unmaps everything and re-maps the first
+    // (buffer_layers + 1) layers.
+    bool reset();
+
     // Pointer to the currently active (ready-to-compute) buffer.
-    const LayerBuffer& active() const { return active_; }
+    const LayerBuffer& active() const { return resident_[current_]; }
 
     std::size_t layer_count() const { return paths_.size(); }
     std::size_t current_index() const { return current_; }
 
+    // Number of layers currently resident (for logging / verification).
+    std::size_t resident_count() const;
+
+    int buffer_layers() const { return buffer_layers_; }
+
 private:
-    bool load_into(LayerBuffer& buf, std::size_t index);
+    // Map a single layer index. Returns false on failure.
+    bool map_layer(std::size_t index);
+    // Unmap a single layer index.
+    void unmap_layer(std::size_t index);
 
     std::vector<std::string> paths_;
     std::vector<MappedFile> maps_;
-    LayerBuffer buffer_a_;
-    LayerBuffer buffer_b_;
-    LayerBuffer active_;
+    std::vector<LayerBuffer> resident_;
+    int buffer_layers_;
     std::size_t current_ = 0;
     bool started_ = false;
 };

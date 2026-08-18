@@ -675,6 +675,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[remora] compute engine ready (primary backend: %s)\n",
                  engine.primary_backend_name());
 
+    // Per-layer ggml context cache. The weights are byte-identical across
+    // tokens; only the mmap base changes. Building each block's contexts
+    // once and reusing them across tokens avoids re-initializing a CPU
+    // backend and re-copying ~376 KB of F32 weights per layer per token.
+    remora::LayerCache layer_cache;
+
     auto t0 = std::chrono::steady_clock::now();
 
     // ---- Prefill: run prompt tokens, updating recurrent state ------------
@@ -692,7 +698,7 @@ int main(int argc, char** argv) {
             layer.weights_base  = buf.data;
             layer.weights_size  = buf.size;
             layer.desc          = &descs[streamer.current_index()];
-            run_layer_forward(ctx, layer, engine);
+            run_layer_forward(ctx, layer, engine, layer_cache);
         } while (streamer.advance());
         ctx.step++;
     }
@@ -717,7 +723,7 @@ int main(int argc, char** argv) {
             layer.weights_base  = buf.data;
             layer.weights_size  = buf.size;
             layer.desc          = &descs[streamer.current_index()];
-            run_layer_forward(ctx, layer, engine);
+            run_layer_forward(ctx, layer, engine, layer_cache);
         } while (streamer.advance());
 
         // Final RMSNorm + lm_head -> logits.

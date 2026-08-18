@@ -16,6 +16,7 @@ namespace remora {
 // when REMORA_HAVE_GGML is disabled (the full definition lives under the
 // guard below).
 class ComputeEngine;
+class LayerCache;
 
 // ---------------------------------------------------------------------------
 // Model configuration (parsed from manifest.json).
@@ -171,7 +172,58 @@ struct GlobalContext {
 // ctx in place. Uses `engine` for all ggml compute. Returns the number of
 // weight bytes consumed (or, in ggml mode, the size of the shard file).
 std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer,
-                              ComputeEngine& engine);
+                              ComputeEngine& engine, LayerCache& cache);
+
+// Per-layer cache of the ggml contexts that describe each block's weights.
+//
+// The weights are memory-mapped and byte-identical across every token; only
+// the mmap base pointer changes. Rebuilding the ggml_context (10 tensors,
+// a fresh CPU backend, and ~376 KB of F32 weight copies) on every layer,
+// every token is the dominant cost of the forward pass. LayerCache builds
+// each block's contexts once and reuses them across tokens, re-pointing only
+// the aliased quantized weight data pointers to the current shard base.
+//
+// The streamer sweeps all N blocks per token, so the cache holds one entry
+// per block (all resident at once). Total footprint is ~18 MB of F32 weight
+// copies + ~8 MB of activation tensors for a 48-block Mamba-1.4B.
+class LayerCache {
+public:
+    LayerCache() = default;
+    ~LayerCache();
+
+    LayerCache(const LayerCache&) = delete;
+    LayerCache& operator=(const LayerCache&) = delete;
+
+    // Build (or fetch) the cached contexts for `desc`. `shard_base` is the
+    // current mmap base for the block; quantized weight data pointers are
+    // re-pointed to it on every call. Returns true on success.
+    bool prepare(const LayerDesc& desc, const void* shard_base,
+                 std::size_t shard_size, ComputeEngine& engine);
+
+    // Accessors for the cached contexts of the most recently prepared block
+    // (valid after a successful prepare).
+    struct ggml_context* block_ctx() const { return cur_->blk_ctx; }
+    struct ggml_context* act_ctx() const { return cur_->act_ctx; }
+
+private:
+    // A quantized weight tensor that aliases into the shard mmap. Its data
+    // pointer must be re-pointed to the current shard base on every prepare.
+    struct QuantizedRef {
+        struct ggml_tensor* tensor = nullptr;
+        std::size_t offset = 0;
+    };
+
+    // One block's cached contexts.
+    struct Entry {
+        int block_id = -1;
+        struct ggml_context* blk_ctx = nullptr;  // owns the weight tensors
+        struct ggml_context* act_ctx = nullptr;   // owns the activation tensors
+        std::vector<QuantizedRef> quantized;      // aliased quantized weights
+    };
+
+    std::vector<Entry> entries_;   // one per block, indexed by block_id
+    Entry* cur_ = nullptr;         // most recently prepared entry
+};
 
 #ifdef REMORA_HAVE_GGML
 // ---------------------------------------------------------------------------
@@ -186,14 +238,6 @@ ggml_type remora_dtype_from_string(const std::string& s);
 // Returns 0 on error.
 std::size_t remora_tensor_nbytes(ggml_type type,
                                  const std::vector<int64_t>& shape);
-
-// Build a ggml_context that owns a copy of one block's tensors, given a
-// memory-mapped shard and the parsed sidecar. Returns nullptr on failure.
-// The caller is responsible for ggml_free()-ing the returned context.
-struct ggml_context* remora_build_block_ctx(
-    const void* shard_base,
-    std::size_t shard_size,
-    const LayerDesc& desc);
 
 #endif  // REMORA_HAVE_GGML
 

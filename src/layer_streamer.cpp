@@ -2,7 +2,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <stdexcept>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -99,10 +98,11 @@ void MappedFile::close() {
 }
 
 // ---------------------------------------------------------------------------
-// LayerStreamer
+// LayerStreamer — true sliding window
 // ---------------------------------------------------------------------------
 
-LayerStreamer::LayerStreamer(std::size_t /*buffer_capacity*/) {}
+LayerStreamer::LayerStreamer(int buffer_layers)
+    : buffer_layers_(buffer_layers < 0 ? 0 : buffer_layers) {}
 
 LayerStreamer::~LayerStreamer() = default;
 
@@ -110,25 +110,55 @@ void LayerStreamer::set_layer_paths(std::vector<std::string> paths) {
     paths_ = std::move(paths);
     maps_.clear();
     maps_.resize(paths_.size());
+    resident_.clear();
+    resident_.resize(paths_.size());
     current_ = 0;
     started_ = false;
 }
 
-bool LayerStreamer::load_into(LayerBuffer& buf, std::size_t index) {
+bool LayerStreamer::map_layer(std::size_t index) {
     if (index >= paths_.size()) return false;
+    if (maps_[index].is_open()) return true;  // already mapped
     if (!maps_[index].open(paths_[index])) return false;
-    buf.path = paths_[index];
-    buf.size = maps_[index].size();
-    buf.data = maps_[index].data();
-    buf.resident = true;
+    resident_[index].path = paths_[index];
+    resident_[index].size = maps_[index].size();
+    resident_[index].data = maps_[index].data();
+    resident_[index].resident = true;
     return true;
+}
+
+void LayerStreamer::unmap_layer(std::size_t index) {
+    if (index >= maps_.size()) return;
+    maps_[index].close();
+    resident_[index].data = nullptr;
+    resident_[index].size = 0;
+    resident_[index].resident = false;
 }
 
 bool LayerStreamer::start() {
     if (paths_.empty()) return false;
-    // Preload the first layer into buffer A.
-    if (!load_into(buffer_a_, 0)) return false;
-    active_ = buffer_a_;
+    // Map the first layer and the next `buffer_layers` lookahead.
+    const std::size_t n_initial =
+        std::min(static_cast<std::size_t>(buffer_layers_) + 1, paths_.size());
+    for (std::size_t i = 0; i < n_initial; ++i) {
+        if (!map_layer(i)) return false;
+    }
+    current_ = 0;
+    started_ = true;
+    return true;
+}
+
+bool LayerStreamer::reset() {
+    if (paths_.empty()) return false;
+    // Unmap everything and re-map the initial window.
+    for (std::size_t i = 0; i < maps_.size(); ++i) {
+        unmap_layer(i);
+    }
+    const std::size_t n_initial =
+        std::min(static_cast<std::size_t>(buffer_layers_) + 1, paths_.size());
+    for (std::size_t i = 0; i < n_initial; ++i) {
+        if (!map_layer(i)) return false;
+    }
     current_ = 0;
     started_ = true;
     return true;
@@ -136,25 +166,30 @@ bool LayerStreamer::start() {
 
 bool LayerStreamer::advance() {
     if (!started_) return false;
-    std::size_t next = current_ + 1;
+    const std::size_t next = current_ + 1;
     if (next >= paths_.size()) return false;
 
-    // The buffer that just finished computing is reused for the next read.
-    // If the active buffer is A, stream into B and vice versa.
-    LayerBuffer& free_buf =
-        (active_.data == buffer_a_.data) ? buffer_b_ : buffer_a_;
+    // Unmap the layer that just finished.
+    unmap_layer(current_);
 
-    if (free_buf.resident) {
-        // Release the previous mapping for this slot.
-        std::size_t old_idx = (free_buf.data == buffer_a_.data) ? current_ : current_;
-        (void)old_idx;
-        free_buf.resident = false;
+    // Stream in the layer `buffer_layers` positions ahead of the new
+    // running layer (if any). This is what keeps the window at
+    // (buffer_layers + 1) resident layers.
+    const std::size_t lookahead = next + static_cast<std::size_t>(buffer_layers_);
+    if (lookahead < paths_.size()) {
+        if (!map_layer(lookahead)) return false;
     }
 
-    if (!load_into(free_buf, next)) return false;
-    active_ = free_buf;
     current_ = next;
     return true;
+}
+
+std::size_t LayerStreamer::resident_count() const {
+    std::size_t n = 0;
+    for (const auto& r : resident_) {
+        if (r.resident) ++n;
+    }
+    return n;
 }
 
 }  // namespace remora

@@ -153,27 +153,54 @@ bool ComputeEngine::compute(struct ggml_cgraph* gf) {
 }
 
 // ---------------------------------------------------------------------------
-// Build a ggml_context that owns one block's worth of tensors. Each tensor's
-// `.data` pointer is wired to point into the memory-mapped shard file at the
-// recorded offset.
+// LayerCache: build each block's ggml contexts once and reuse them.
 //
-// Quantized weights are *aliased* (their data pointer points into the shard
-// mmap, zero-copy) because the dequant path is read-only. F32 weights are
-// copied into a per-block host buffer so the kernel can overwrite them if
-// needed. The returned context owns the F32 copies and the tensor metadata.
+// The weights are memory-mapped and byte-identical across every token; only
+// the mmap base pointer changes. Rebuilding the ggml_context (10 tensors, a
+// fresh CPU backend, and ~376 KB of F32 weight copies) on every layer, every
+// token is the dominant cost of the forward pass. LayerCache builds each
+// block's contexts once and reuses them, re-pointing only the aliased
+// quantized weight data pointers to the current shard base.
 // ---------------------------------------------------------------------------
-struct ggml_context* remora_build_block_ctx(
-    const void* shard_base,
-    std::size_t shard_size,
-    const LayerDesc& desc)
-{
-    // Enough room for tensor metadata: ~ sizeof(ggml_tensor) per tensor.
+
+LayerCache::~LayerCache() {
+    for (auto& e : entries_) {
+        if (e.act_ctx) ggml_free(e.act_ctx);
+        if (e.blk_ctx) ggml_free(e.blk_ctx);
+    }
+}
+
+bool LayerCache::prepare(const LayerDesc& desc, const void* shard_base,
+                         std::size_t shard_size, ComputeEngine& engine) {
+    // Fast path: this block was already built. Just re-point the aliased
+    // quantized weights to the current shard base.
+    if (desc.block_id >= 0 && desc.block_id < (int)entries_.size()) {
+        Entry& e = entries_[desc.block_id];
+        if (e.blk_ctx && e.act_ctx) {
+            for (auto& q : e.quantized) {
+                const void* p = static_cast<const uint8_t*>(shard_base) + q.offset;
+                q.tensor->data = const_cast<void*>(p);
+            }
+            cur_ = &e;
+            return true;
+        }
+    }
+
+    // Cold path: build this block's contexts and store them.
+    if (desc.block_id < 0) return false;
+    if (desc.block_id >= (int)entries_.size()) {
+        entries_.resize(desc.block_id + 1);
+    }
+    Entry& e = entries_[desc.block_id];
+    e.block_id = desc.block_id;
+
+    // --- Weight context: aliases quantized weights, copies F32 weights. ---
     constexpr std::size_t kMetaBytes = 64 * 1024;
     struct ggml_init_params p = { .mem_size = kMetaBytes,
                                    .mem_buffer = nullptr,
                                    .no_alloc = true };
-    struct ggml_context* ctx = ggml_init(p);
-    if (!ctx) return nullptr;
+    e.blk_ctx = ggml_init(p);
+    if (!e.blk_ctx) return false;
 
     // First pass: create every tensor with the right shape + dtype.
     for (const TensorDesc& td : desc.tensors) {
@@ -187,7 +214,7 @@ struct ggml_context* remora_build_block_ctx(
         }
         int n_dims = static_cast<int>(td.shape.size());
         std::vector<int64_t> ne(td.shape.begin(), td.shape.end());
-        ggml_tensor* t_tensor = ggml_new_tensor(ctx, t, n_dims, ne.data());
+        ggml_tensor* t_tensor = ggml_new_tensor(e.blk_ctx, t, n_dims, ne.data());
         if (!t_tensor) {
             std::fprintf(stderr,
                 "[remora] ggml_new_tensor failed for '%s'\n", td.name.c_str());
@@ -197,24 +224,21 @@ struct ggml_context* remora_build_block_ctx(
         ggml_set_name(t_tensor, short_name.c_str());
     }
 
-    // For each tensor, point its data at the shard at the recorded offset.
-    // Quantized: alias (zero-copy). F32: copy so it's self-contained.
-    // (We allocate a CPU host buffer for the F32 copies via a temporary
-    //  backend; the metadata tensors use the same no_alloc ctx.)
+    // Allocate the F32 weight copies from a CPU buffer type.
     ggml_backend_t cpu =
         ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu) {
         std::fprintf(stderr, "[remora] failed to init CPU backend\n");
-        ggml_free(ctx);
-        return nullptr;
+        ggml_free(e.blk_ctx); e.blk_ctx = nullptr;
+        return false;
     }
     ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(cpu);
-    ggml_backend_alloc_ctx_tensors_from_buft(ctx, cpu_buft);
+    ggml_backend_alloc_ctx_tensors_from_buft(e.blk_ctx, cpu_buft);
 
     for (const TensorDesc& td : desc.tensors) {
         if (td.shape.empty()) continue;
         std::string short_name = strip_blk_prefix(td.name);
-        ggml_tensor* t_tensor = ggml_get_tensor(ctx, short_name.c_str());
+        ggml_tensor* t_tensor = ggml_get_tensor(e.blk_ctx, short_name.c_str());
         if (!t_tensor) continue;
 
         const std::size_t want = ggml_nbytes(t_tensor);
@@ -228,15 +252,77 @@ struct ggml_context* remora_build_block_ctx(
 
         if (ggml_is_quantized(t_tensor->type)) {
             // Quantized: alias (don't copy) — the dequant path is read-only.
+            // Record the offset so we can re-point it on later prepares.
             t_tensor->data = const_cast<void*>(src);
+            e.quantized.push_back({ t_tensor, td.offset });
         } else {
             // Plain (F32): copy so the tensor is self-contained.
             std::memcpy(t_tensor->data, src, want);
         }
     }
-
     ggml_backend_free(cpu);
-    return ctx;
+
+    // --- Activation context: 14 tensors, allocated from the engine. ---
+    constexpr std::size_t kActBytes = 8 * 1024 * 1024;
+    struct ggml_init_params ap = { .mem_size = kActBytes,
+                                   .mem_buffer = nullptr,
+                                   .no_alloc = true };
+    e.act_ctx = ggml_init(ap);
+    if (!e.act_ctx) {
+        ggml_free(e.blk_ctx); e.blk_ctx = nullptr;
+        return false;
+    }
+
+    // We need the config dims; they're not in the LayerDesc, so derive from
+    // the weight tensor shapes.
+    ggml_tensor* w_in = ggml_get_tensor(e.blk_ctx, "ssm_in.weight");
+    ggml_tensor* w_out = ggml_get_tensor(e.blk_ctx, "ssm_out.weight");
+    ggml_tensor* w_x = ggml_get_tensor(e.blk_ctx, "ssm_x.weight");
+    ggml_tensor* w_dt = ggml_get_tensor(e.blk_ctx, "ssm_dt.weight");
+    ggml_tensor* w_conv = ggml_get_tensor(e.blk_ctx, "ssm_conv1d.weight");
+    if (!w_in || !w_out || !w_x || !w_dt || !w_conv) {
+        std::fprintf(stderr, "[remora] cache: missing weight tensors in block %d\n",
+                     desc.block_id);
+        ggml_free(e.act_ctx); e.act_ctx = nullptr;
+        ggml_free(e.blk_ctx); e.blk_ctx = nullptr;
+        return false;
+    }
+    // ggml stores ne[0] as the fastest-varying dim. For these weight tensors:
+    //   ssm_in.weight  [d_model, 2*d_inner]  -> ne[0]=d_model, ne[1]=2*d_inner
+    //   ssm_out.weight [d_inner, d_model]    -> ne[0]=d_inner, ne[1]=d_model
+    //   ssm_dt.weight  [dt_rank, d_inner]    -> ne[0]=dt_rank, ne[1]=d_inner
+    //   ssm_x.weight   [d_inner, dt_rank+2*d_state] -> ne[0]=d_inner, ne[1]=...
+    const int64_t d_inner = w_in->ne[1] / 2;      // 2*d_inner
+    const int64_t d_model = w_out->ne[1];
+    const int64_t dt_rank = w_dt->ne[0];
+    const int64_t d_state = (w_x->ne[1] - dt_rank) / 2;  // dt_rank + 2*d_state
+
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_model), "y_norm");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, 2 * d_inner), "xz");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "x_pre");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "z_pre");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "x_conv");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "x_act");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, dt_rank + 2*d_state), "x_dtbc");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, dt_rank), "dt_pre");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_state), "B_pre");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_state), "C_pre");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "dt_soft");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "y_ssm");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_inner), "y_gated");
+    ggml_set_name(ggml_new_tensor_1d(e.act_ctx, GGML_TYPE_F32, d_model), "y_out");
+
+    if (!ggml_backend_alloc_ctx_tensors_from_buft(e.act_ctx, engine.buft())) {
+        std::fprintf(stderr,
+            "[remora] cache: failed to allocate activation tensors (block %d)\n",
+            desc.block_id);
+        ggml_free(e.act_ctx); e.act_ctx = nullptr;
+        ggml_free(e.blk_ctx); e.blk_ctx = nullptr;
+        return false;
+    }
+
+    cur_ = &e;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,18 +382,27 @@ std::size_t run_mamba_block(
         const LayerDesc& desc,
         const void* shard_base,
         std::size_t shard_size,
-        ComputeEngine& engine)
+        ComputeEngine& engine,
+        LayerCache& cache)
 {
-    ggml_context* blk_ctx = remora_build_block_ctx(shard_base, shard_size, desc);
-    if (!blk_ctx) return 0;
+    // Build (or fetch) the cached ggml contexts for this block. The weights
+    // are byte-identical across tokens; only the mmap base changes, so we
+    // re-point the aliased quantized weights and reuse everything else.
+    if (!cache.prepare(desc, shard_base, shard_size, engine)) return 0;
 
-    // Allocate activation tensors in one no_alloc context; the ComputeEngine
-    // scheduler allocates the actual compute buffers on first graph run.
-    constexpr std::size_t kActBytes = 8 * 1024 * 1024;
-    struct ggml_init_params ap = { .mem_size = kActBytes,
+    ggml_context* blk_ctx = cache.block_ctx();
+    ggml_context* act     = cache.act_ctx();
+
+    // Fresh scratch context for the transient graph tensors (matmul results,
+    // elementwise intermediates, and the cgraph). The persistent activation
+    // tensors live in the cached `act` context; the transient tensors must
+    // NOT accumulate there across calls or the 8 MB buffer overflows.
+    constexpr std::size_t kScratchBytes = 4 * 1024 * 1024;
+    struct ggml_init_params sp = { .mem_size = kScratchBytes,
                                    .mem_buffer = nullptr,
                                    .no_alloc = true };
-    ggml_context* act = ggml_init(ap);
+    ggml_context* scratch = ggml_init(sp);
+    if (!scratch) return 0;
 
     // Locate the parameter tensors by name.
     ggml_tensor* w_norm    = ggml_get_tensor(blk_ctx, "attn_norm.weight");
@@ -324,7 +419,6 @@ std::size_t run_mamba_block(
         !b_dt_proj || !w_ssm_x || !ssm_a || !ssm_d || !w_out_proj) {
         std::fprintf(stderr,
             "[remora] missing required tensors in block %d\n", desc.block_id);
-        ggml_free(act); ggml_free(blk_ctx);
         return 0;
     }
 
@@ -334,36 +428,24 @@ std::size_t run_mamba_block(
     const int64_t d_conv  = ctx.cfg.d_conv;
     const int64_t dt_rank = ctx.cfg.dt_rank;
 
-    // Activation tensors. All created in a no_alloc context, then allocated
-    // from the engine's CPU buffer type so every tensor has a valid host
-    // `->data` pointer. The forward pass reads/writes these directly (the
-    // hand-rolled conv1d / scan / silu loops and memcpy staging), so they
-    // must be host-visible.
-    ggml_tensor* y_norm = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_model);
-    ggml_tensor* xz     = ggml_new_tensor_1d(act, GGML_TYPE_F32, 2 * d_inner);
-    ggml_tensor* x_pre  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* z_pre  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* x_conv = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* x_act  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* x_dtbc = ggml_new_tensor_1d(act, GGML_TYPE_F32, dt_rank + 2*d_state);
-    ggml_tensor* dt_pre = ggml_new_tensor_1d(act, GGML_TYPE_F32, dt_rank);
-    ggml_tensor* B_pre  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_state);
-    ggml_tensor* C_pre  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_state);
-    ggml_tensor* dt_soft= ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* y_ssm  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* y_gated= ggml_new_tensor_1d(act, GGML_TYPE_F32, d_inner);
-    ggml_tensor* y_out  = ggml_new_tensor_1d(act, GGML_TYPE_F32, d_model);
+    // Activation tensors, fetched from the cached (pre-allocated) context.
+    ggml_tensor* y_norm = ggml_get_tensor(act, "y_norm");
+    ggml_tensor* xz     = ggml_get_tensor(act, "xz");
+    ggml_tensor* x_pre  = ggml_get_tensor(act, "x_pre");
+    ggml_tensor* z_pre  = ggml_get_tensor(act, "z_pre");
+    ggml_tensor* x_conv = ggml_get_tensor(act, "x_conv");
+    ggml_tensor* x_act  = ggml_get_tensor(act, "x_act");
+    ggml_tensor* x_dtbc = ggml_get_tensor(act, "x_dtbc");
+    ggml_tensor* dt_pre = ggml_get_tensor(act, "dt_pre");
+    ggml_tensor* B_pre  = ggml_get_tensor(act, "B_pre");
+    ggml_tensor* C_pre  = ggml_get_tensor(act, "C_pre");
+    ggml_tensor* dt_soft= ggml_get_tensor(act, "dt_soft");
+    ggml_tensor* y_ssm  = ggml_get_tensor(act, "y_ssm");
+    ggml_tensor* y_gated= ggml_get_tensor(act, "y_gated");
+    ggml_tensor* y_out  = ggml_get_tensor(act, "y_out");
 
-    if (!ggml_backend_alloc_ctx_tensors_from_buft(act, engine.buft())) {
-        std::fprintf(stderr,
-            "[remora] failed to allocate activation tensors (block %d)\n",
-            desc.block_id);
-        ggml_free(act); ggml_free(blk_ctx);
-        return 0;
-    }
-
-    // Copy the residual stream into y_norm. y_norm now has a valid host
-    // `->data` (allocated from the CPU buft above).
+    // Copy the residual stream into y_norm. y_norm has a valid host
+    // `->data` (allocated from the engine's CPU buft in the cache).
     std::memcpy(y_norm->data, ctx.hidden_state.data(), d_model * sizeof(float));
 
     // 1. RMSNorm.
@@ -381,10 +463,10 @@ std::size_t run_mamba_block(
 
     // 2. in_proj: xz = ssm_in @ y_norm -> [2*d_inner].
     {
-        ggml_tensor* in_xz = ggml_mul_mat(act, w_in_proj, y_norm);
-        ggml_cgraph* gf = ggml_new_graph(act);
+        ggml_tensor* in_xz = ggml_mul_mat(scratch, w_in_proj, y_norm);
+        ggml_cgraph* gf = ggml_new_graph(scratch);
         ggml_build_forward_expand(gf, in_xz);
-        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
+        if (!engine.compute(gf)) { ggml_free(scratch); return 0; }
         std::memcpy(xz->data, in_xz->data, 2 * d_inner * sizeof(float));
     }
 
@@ -418,10 +500,10 @@ std::size_t run_mamba_block(
 
     // 5. ssm_x @ x_act -> x_db [dt_rank + 2*d_state]; split into dt/B/C.
     {
-        ggml_tensor* xbc = ggml_mul_mat(act, w_ssm_x, x_act);
-        ggml_cgraph* gf = ggml_new_graph(act);
+        ggml_tensor* xbc = ggml_mul_mat(scratch, w_ssm_x, x_act);
+        ggml_cgraph* gf = ggml_new_graph(scratch);
         ggml_build_forward_expand(gf, xbc);
-        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
+        if (!engine.compute(gf)) { ggml_free(scratch); return 0; }
         std::memcpy(x_dtbc->data, xbc->data,
                     (dt_rank + 2*d_state) * sizeof(float));
     }
@@ -437,12 +519,12 @@ std::size_t run_mamba_block(
 
     // 6. dt_proj: dt = ssm_dt @ dt_pre + ssm_dt_b; softplus -> [d_inner].
     {
-        ggml_tensor* dt_lin = ggml_mul_mat(act, w_dt_proj, dt_pre);
-        ggml_tensor* dt_bias = ggml_add(act, dt_lin, b_dt_proj);
-        ggml_tensor* dt_sp = ggml_softplus(act, dt_bias);
-        ggml_cgraph* gf = ggml_new_graph(act);
+        ggml_tensor* dt_lin = ggml_mul_mat(scratch, w_dt_proj, dt_pre);
+        ggml_tensor* dt_bias = ggml_add(scratch, dt_lin, b_dt_proj);
+        ggml_tensor* dt_sp = ggml_softplus(scratch, dt_bias);
+        ggml_cgraph* gf = ggml_new_graph(scratch);
         ggml_build_forward_expand(gf, dt_sp);
-        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
+        if (!engine.compute(gf)) { ggml_free(scratch); return 0; }
         std::memcpy(dt_soft->data, dt_sp->data, d_inner * sizeof(float));
     }
 
@@ -486,10 +568,10 @@ std::size_t run_mamba_block(
 
     // 9. out_proj: y_out = ssm_out @ y_gated -> [d_model].
     {
-        ggml_tensor* yo = ggml_mul_mat(act, w_out_proj, y_gated);
-        ggml_cgraph* gf = ggml_new_graph(act);
+        ggml_tensor* yo = ggml_mul_mat(scratch, w_out_proj, y_gated);
+        ggml_cgraph* gf = ggml_new_graph(scratch);
         ggml_build_forward_expand(gf, yo);
-        if (!engine.compute(gf)) { ggml_free(act); ggml_free(blk_ctx); return 0; }
+        if (!engine.compute(gf)) { ggml_free(scratch); return 0; }
         std::memcpy(y_out->data, yo->data, d_model * sizeof(float));
     }
 
@@ -500,9 +582,7 @@ std::size_t run_mamba_block(
         for (int64_t i = 0; i < d_model; ++i) h[i] += yo[i];
     }
 
-    ggml_free(act);
-    ggml_free(blk_ctx);
-
+    ggml_free(scratch);
     return shard_size;
 }
 
@@ -648,11 +728,11 @@ bool GlobalContext::compute_logits(RuntimeContext& ctx,
 
 // Public dispatch.
 std::size_t run_layer_forward(RuntimeContext& ctx, const LayerContext& layer,
-                              ComputeEngine& engine) {
+                              ComputeEngine& engine, LayerCache& cache) {
     if (!layer.desc) return 0;
     // For now we only handle the Mamba architecture.
     return run_mamba_block(ctx, *layer.desc,
-                           layer.weights_base, layer.weights_size, engine);
+                           layer.weights_base, layer.weights_size, engine, cache);
 }
 
 #endif  // REMORA_HAVE_GGML

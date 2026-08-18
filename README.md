@@ -35,6 +35,102 @@ VRAM.
 
 ---
 
+## Theory: Sparse MoE where every expert is an RNN
+
+Remora's structure is a natural fit for a *sparse mixture-of-experts* where
+each expert is itself a recurrent (RNN) block. Here is the theory of why that
+combination is compelling, and how it maps onto the layer-by-layer streaming
+design.
+
+### 1. The core idea
+
+A classic transformer MoE keeps a single large model and routes each token to
+a few of its many feed-forward experts. The experts are *dense* and *stateless*:
+they transform one token in isolation and forget it immediately.
+
+Remora inverts this. Instead of many stateless experts inside one model, we
+treat **each expert as a full recurrent block** — a Mamba / RWKV / linear-attention
+layer with its own persistent hidden state. The router picks, per token, which
+expert(s) should process the current hidden state, and only those experts'
+weights are streamed in and run.
+
+### 2. Why RNN experts are the right primitive
+
+- **O(1) state per expert.** A recurrent expert compresses its entire history
+  into a fixed-size hidden state. So the cost of "keeping an expert warm" is
+  constant — it does not grow with sequence length. This is what makes it
+  feasible to have *hundreds* of experts: the resident working set is just the
+  union of the active experts' hidden states, not their weights.
+- **State is the memory, weights are the disk.** The expensive part of an
+  expert (its weight matrices) lives on SSD and is streamed in only when the
+  expert is selected. The cheap part (its hidden state) stays resident. This is
+  exactly the split Remora's layer streamer already implements.
+- **Sparsity buys capacity, not just speed.** A dense model's capacity is
+  bounded by its parameter count. A sparse MoE of RNN experts can hold far more
+  total parameters on disk than would ever fit in VRAM, and only materialize
+  the small active subset. The "model" is effectively unbounded.
+
+### 3. Routing over recurrent state
+
+Routing in a transformer MoE is a function of the *token* embedding. Routing
+in Remora is a function of the *recurrent hidden state* — which already
+summarizes the whole conversation. This is a strictly richer signal:
+
+- The router sees not just "what token is this" but "where is the conversation
+  going", so it can pick experts that are specialized for the current topic,
+  style, or task.
+- Because the hidden state is O(1), the router itself can be a small always-
+  resident draft model (Remora's `draft_router.cpp`) that runs on every token
+  at negligible cost.
+
+### 4. The layer-by-layer structure makes this cheap
+
+The key structural insight is that **an RNN expert and a layer are the same
+thing in Remora**. The streamer already sweeps one block at a time; a sparse
+MoE just changes *which* blocks get swept for a given token:
+
+- **Dense path (today):** every token visits all 48 blocks in order.
+- **Sparse path (the theory):** the router picks, say, 4 of 1000 expert blocks
+  per token. Only those 4 are streamed and computed. The other 996 stay on
+  disk, untouched.
+
+The resident memory is bounded by the *active* experts' hidden states plus the
+streaming window — not by the total number of experts. So you can scale the
+expert pool to the size of your SSD, not your RAM.
+
+### 5. What this buys us
+
+| Property | Dense RNN (today) | Sparse RNN MoE (theory) |
+| -------- | ----------------- | ----------------------- |
+| Experts per token | all layers | a small routed subset |
+| Total capacity | bounded by one model | bounded by SSD space |
+| Resident memory | O(active layers) | O(active experts) |
+| Specialization | none (one model) | per-topic / per-task experts |
+| Switching cost | stream next layer | stream next *expert* |
+
+### 6. Open questions / research directions
+
+- **Router quality.** Does routing on the recurrent hidden state converge to
+  stable, meaningful expert specializations, or does it thrash between experts
+  token-to-token? (A soft / top-k router with a small temperature may help.)
+- **State handoff.** When a token is routed to an expert that has not been
+  active for a while, its hidden state is stale. Do we need a "state refresh"
+  pass, or is the recurrence forgiving enough to recover in a few tokens?
+- **Load balancing.** Sparse MoEs are prone to a few experts absorbing all the
+  traffic. Recurrent experts add a second axis: an expert's state can go stale
+  if it is under-selected. Balancing must consider both routing frequency and
+  state freshness.
+- **Expert granularity.** Is the right unit a full recurrent block, or a
+  *sub-layer* (e.g. just the SSM, or just the gating projection)? Finer
+  granularity means more routing decisions but smaller streamed units.
+
+This is the direction Remora's architecture is built to explore: the streaming
+infrastructure, the O(1) state contract, and the draft router are all already
+in place. The missing piece is the sparse routing policy that decides, per
+token, which expert blocks to sweep.
+
+---
+
 ## Architectural Comparison
 
 | Metric | Traditional Transformer | Remora Layer-by-Layer RNN MoE |

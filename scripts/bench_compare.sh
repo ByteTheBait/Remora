@@ -96,7 +96,8 @@ START_NS=$(date +%s%N)
 "$REMORA_BIN" \
     --routing "$ROUTING" \
     --layers "$LAYERS_DIR" \
-    --tokens 8 \
+    --tokens "$N_PREDICT" \
+    --prompt "$PROMPT" \
     > "$REMORA_LOG" 2>&1 &
 REMORA_PID=$!
 
@@ -111,15 +112,16 @@ END_NS=$(date +%s%N)
 
 REMORA_WALL_MS=$(( (END_NS - START_NS) / 1000000 ))
 
-# Detect first-output timestamp (proxy for TTFT in the placeholder runtime).
-# Remora's first per-layer printf is "   layer 1/N done ...".
-REMORA_FIRST_OUTPUT_MS=$(awk -v t0="$START_NS" '
-    /layer 1\// {
-        # Convert ms epoch to relative ms.
-        cmd = "date +%s%N"; cmd | getline now; close(cmd);
-        rel_ms = int((now - t0) / 1000000);
-        print rel_ms; exit
-    }' "$REMORA_LOG")
+# The real Remora kernel prints its own timing lines:
+#   [remora] generated N tokens in X ms (ttft Y ms)
+#   [remora] gen tok/s: Z
+REMORA_TIMING=$(grep -E 'generated [0-9]+ tokens in [0-9]+ ms' "$REMORA_LOG" | tail -1 || true)
+REMORA_TPS=$(grep -E 'gen tok/s:' "$REMORA_LOG" | tail -1 | sed -nE 's/.*gen tok\/s: *([0-9.]+).*/\1/p' || true)
+REMORA_TPS=${REMORA_TPS:-n/a}
+REMORA_TTFT_MS=$(echo "$REMORA_TIMING" | sed -nE 's/.*\(ttft ([0-9]+) ms\).*/\1/p' || true)
+REMORA_TTFT_MS=${REMORA_TTFT_MS:-N/A}
+REMORA_N_TOK=$(echo "$REMORA_TIMING" | sed -nE 's/.*generated ([0-9]+) tokens.*/\1/p' || true)
+REMORA_N_TOK=${REMORA_N_TOK:-0}
 
 # Peak RSS from the sampler (KB).
 REMORA_PEAK_KB=$(awk '{print $2}' "$REMORA_RSS" | sort -n | tail -1)
@@ -129,17 +131,11 @@ REMORA_PEAK_KB=${REMORA_PEAK_KB:-0}
 REMORA_STREAM_MBPS=$(awk -v b="$TOTAL_BYTES" -v ms="$REMORA_WALL_MS" '
     BEGIN{ if (ms <= 0) { print "0.0"; exit } printf "%.1f", (b/1024.0/1024.0) / (ms/1000.0) }')
 
-# Tokens/sec for the placeholder: total work is LAYER_COUNT iterations; we
-# report layers/sec as a comparable throughput number. The placeholder is NOT
-# a real token generator, so we label the unit clearly.
-REMORA_LAYERSPERSEC=$(awk -v n="$LAYER_COUNT" -v ms="$REMORA_WALL_MS" '
-    BEGIN{ if (ms <= 0) { print "0.0"; exit } printf "%.2f", n / (ms/1000.0) }')
-
 log "Remora wall:     ${REMORA_WALL_MS} ms"
-log "Remora first-out (TTFT proxy): ${REMORA_FIRST_OUTPUT_MS:-N/A} ms"
+log "Remora TTFT:     ${REMORA_TTFT_MS} ms"
+log "Remora TPS:      ${REMORA_TPS} tok/s"
 log "Remora peak RSS: ${REMORA_PEAK_KB} KB (~$(awk -v k="$REMORA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}') MiB)"
 log "Remora stream:   ${REMORA_STREAM_MBPS} MiB/s"
-log "Remora layers/s: ${REMORA_LAYERSPERSEC} (placeholder kernel, not real TPS)"
 echo
 
 # ---------------------------------------------------------------------------
@@ -311,12 +307,11 @@ fi
     printf "%-30s | %-22s | %-22s | %-22s\n" "model"        "$MODEL"                   "$MODEL"                      "$MODEL"
     printf "%-30s | %-22s | %-22s | %-22s\n" "sharded?"     "yes (${LAYER_COUNT} blocks)" "yes (${LAYER_COUNT} blocks)" "no (single file)"
     printf "%-30s | %-22s | %-22s | %-22s\n" "wall time (ms)"      "$REMORA_WALL_MS"   "$REMORA_LLAMA_WALL_MS"  "$LLAMA_WALL_MS"
-    printf "%-30s | %-22s | %-22s | %-22s\n" "TTFT (ms)"           "${REMORA_FIRST_OUTPUT_MS:-N/A}" "${REMORA_LLAMA_TTFT_MS:-N/A}" "$LLAMA_TTFT_MS"
-    printf "%-30s | %-22s | %-22s | %-22s\n" "tokens generated"    "0 (placeholder)"   "$N_PREDICT"               "$LLAMA_N_TOK"
-    printf "%-30s | %-22s | %-22s | %-22s\n" "tokens/sec"          "n/a"               "${REMORA_LLAMA_TPS}"        "$LLAMA_TPS"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "TTFT (ms)"           "${REMORA_TTFT_MS}" "${REMORA_LLAMA_TTFT_MS:-N/A}" "$LLAMA_TTFT_MS"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "tokens generated"    "$REMORA_N_TOK"     "$N_PREDICT"               "$LLAMA_N_TOK"
+    printf "%-30s | %-22s | %-22s | %-22s\n" "tokens/sec"          "${REMORA_TPS}"      "${REMORA_LLAMA_TPS}"        "$LLAMA_TPS"
     printf "%-30s | %-22s | %-22s | %-22s\n" "gen tok/s (inline)"  "n/a"               "n/a"                       "${INLINE_GEN_TPS:-N/A}"
     printf "%-30s | %-22s | %-22s | %-22s\n" "prompt tok/s (inline)" "n/a"             "n/a"                       "${INLINE_PROMPT_TPS:-N/A}"
-    printf "%-30s | %-22s | %-22s | %-22s\n" "layers/sec (proxy)"  "$REMORA_LAYERSPERSEC" "n/a"                       "n/a"
     printf "%-30s | %-22s | %-22s | %-22s\n" "stream throughput"   "$REMORA_STREAM_MBPS MiB/s" "n/a (loads shards)"   "n/a (mmap-once)"
     printf "%-30s | %-22s | %-22s | %-22s\n" "peak RSS (MiB)"      "$(awk -v k="$REMORA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')" \
                                                           "$(awk -v k="$REMORA_LLAMA_PEAK_KB" 'BEGIN{printf "%.1f", k/1024}')" \
@@ -324,15 +319,15 @@ fi
     printf "%-30s | %-22s | %-22s | %-22s\n" "exit code"           "$REMORA_EXIT"      "$REMORA_LLAMA_EXIT"        "$LLAMA_EXIT"
     echo
     echo "Notes:"
-    echo "  * Remora's RNN kernel is currently a placeholder (h = 0.9h + 0.1x over a"
-    echo "    64-dim state). It streams real bytes off disk via mmap, but does NOT"
-    echo "    run a real Mamba selective scan. 'layers/sec' is a work-rate proxy."
+    echo "  * Remora runs the real Mamba selective-scan kernel over sharded"
+    echo "    weights, streaming one layer at a time from disk via mmap. Its"
+    echo "    TPS is measured from the kernel's own 'gen tok/s' line."
     echo "  * remora_llama is the libllama-based driver: it produces real Mamba"
     echo "    outputs from sharded weights via the same llama.cpp numerics and"
     echo "    sampler as llama-cli. It exists to compare RSS / TTFT / TPS between"
     echo "    sharded-weight streaming and monolithic llama-cli."
-    echo "  * 'TTFT' for Remora is measured as wall time until the first per-layer"
-    echo "    printf; remora_llama's is wall time until 'indexed N tensors' is"
+    echo "  * 'TTFT' for Remora is the kernel's own ttft (time to first generated"
+    echo "    token); remora_llama's is wall time until 'indexed N tensors' is"
     echo "    printed (model-graph ready); llama.cpp's is (total_ms - eval_ms),"
     echo "    which still includes prompt processing."
     echo "  * RSS is sampled from \`ps -o rss=\` at ${SAMPLE_HZ} Hz; peak is the max."
