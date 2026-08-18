@@ -98,6 +98,19 @@ The resident memory is bounded by the *active* experts' hidden states plus the
 streaming window — not by the total number of experts. So you can scale the
 expert pool to the size of your SSD, not your RAM.
 
+Because each expert is an independent recurrent block with its own hidden state,
+the sparse path is embarrassingly parallel: we can **stream each expert
+layer-by-layer as a separate thread**. The router hands the current hidden state
+to the selected experts, and each thread independently streams its own expert's
+weights from SSD, runs its forward pass, and returns its updated state. The
+threads only need to synchronize at the merge point where their outputs are
+combined (e.g. a weighted sum or a gated combination) before the next token is
+routed. This turns the MoE fan-out into a natural multi-threaded pipeline — the
+I/O for expert *B* overlaps with the compute of expert *A* across threads, not
+just across the double-buffered window of a single sequential sweep. The only
+shared resource is the SSD itself, so the practical ceiling is disk bandwidth
+rather than VRAM or a single compute core.
+
 ### 5. What this buys us
 
 | Property | Dense RNN (today) | Sparse RNN MoE (theory) |
