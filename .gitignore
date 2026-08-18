@@ -18,4 +18,5 @@ remora.stdout.log
 remora.rss.log
 remora_llama.stdout.log
 remora_llama.rss.log
+mamba-1.4b-hf*
 bench_results.txt
