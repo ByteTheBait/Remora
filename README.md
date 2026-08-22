@@ -303,7 +303,7 @@ Four inference paths, one model. All numbers are for the Mamba 1.4B model
 | gen tok/s | 27.5 | 3.5 | 28.5 | 61.1 |
 | prompt tok/s | 8.6 | n/a | n/a | 247.7 |
 | TTFT (ms) | 704 | 2302 | 3294 | 2130 |
-| peak RSS (MiB) | ~439 | ~339 | ~1151 | ~822 |
+| peak RSS (MiB) | ~2779 | ~339 | ~1151 | ~822 |
 
 Notes:
 - **MLX (native)** is `scripts/bench_mlx.py` on the converted F16 model. It
