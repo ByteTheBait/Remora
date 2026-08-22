@@ -290,27 +290,41 @@ executed by Apple's MLX runtime rather than the C++ ggml streamer.
 
 This converts `state-spaces/mamba-130m-hf` to MLX, shards it, and runs it.
 
-### Benchmark MLX vs Remora vs llama.cpp
+### Benchmark: MLX (raw) vs Remora (MLX + ggml) vs llama.cpp
 
-```bash
-./scripts/bench_mlx_compare.sh
-```
+Four inference paths, one model. All numbers are for the Mamba 1.4B model
+(`mamba-1.4b-hf.Q4_K_M.gguf`), 5-token prompt (`"Hello, my name is"`),
+64 generated tokens, greedy (temp=0.0), Apple M2 (8 GB RAM):
 
-This runs the MLX-native inference path on a converted model and prints a
-side-by-side table against the existing Remora / llama.cpp numbers in
-`bench_results.txt`. For the Mamba 1.4B model the headline tradeoff is:
+| metric | MLX (raw) | remora_mlx | remora_llama | llama-cli |
+| ------ | --------- | ---------- | ------------ | --------- |
+| engine | mlx_lm (Metal) | C++ MLX (Metal) | libllama (ggml) | llama.cpp |
+| weights | F16 converted | Q4 shards | Q4 shards | Q4 monolithic |
+| gen tok/s | 27.5 | 10.0 | 28.5 | 61.1 |
+| prompt tok/s | 8.6 | n/a | n/a | 247.7 |
+| TTFT (ms) | 704 | 1283 | 3294 | 2130 |
+| peak RSS (MiB) | ~439 | ~1600 | ~1151 | ~822 |
 
-| metric | MLX (Metal) | Remora (C++) | llama.cpp |
-| ------ | ----------- | ------------ | --------- |
-| gen tok/s | ~26 | ~10 | ~53 |
-| peak mem (MiB) | ~2847 | ~199 | ~873 |
+Notes:
+- **MLX (native)** is `scripts/bench_mlx.py` on the converted F16 model. It
+  uses MLX's Metal backend and needs no sharding, but holds the full model
+  resident in memory. It's the fastest native path for the converted weights.
+- **remora_mlx** is the C++ MLX GPU driver (`build/remora_mlx`). It streams
+  Q4 shards with a bounded cache (default: all 48 blocks resident). Slower
+  than raw MLX because the GPU is doing quantized matmuls on streamed shards.
+- **remora_llama** is the libllama-based driver that consumes sharded
+  weights. It produces real Mamba outputs with the same ggml numerics as
+  llama-cli. Its lower gen tok/s is the cost of sharded-weight streaming.
+- **llama.cpp** (`llama-cli`) on the monolithic GGUF is the baseline: it
+  mmaps the whole file once, so it's the fastest of the four at 61.1 tok/s
+  with ~822 MiB peak RSS.
 
-MLX is the fastest *native* path on Apple Silicon and needs no sharding, but
-it holds the full model resident in memory. Remora's layer-by-layer streamer
-uses ~7x less memory by keeping only the active layer + lookahead resident —
-the tradeoff for that memory win is lower throughput. This is exactly the
-design point Remora targets: **capacity and memory efficiency over raw
-speed**, so you can hold hundreds of expert models on one SSD.
+The headline tradeoff: raw **MLX** and **llama.cpp** both hold the full
+model in memory; **remora_llama** and **remora_mlx** stream weights from
+disk layer-by-layer. For the 1.4B model the streamer is 2–5x slower, but
+for models larger than RAM it's the only path that fits — the design point
+Remora targets: **capacity and memory efficiency over raw speed**, so you
+can hold hundreds of expert models on one SSD.
 
 ### How it fits together
 
