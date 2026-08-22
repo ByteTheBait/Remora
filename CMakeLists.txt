@@ -64,12 +64,13 @@ endif()
 # Core library
 # ---------------------------------------------------------------------------
 
-add_library(remora_core STATIC
+set(REMORA_CORE_SOURCES
     src/layer_streamer.cpp
     src/draft_router.cpp
     src/rnn_kernel.cpp
     src/tokenizer.cpp
 )
+add_library(remora_core STATIC ${REMORA_CORE_SOURCES})
 target_include_directories(remora_core PUBLIC src)
 
 if(REMORA_HAVE_GGML)
@@ -132,6 +133,59 @@ if(REMORA_HAVE_GGML AND NOT GGML_DIR)
 endif()
 
 install(TARGETS remora RUNTIME DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# remora_mlx — MLX GPU compute engine for Apple Silicon.
+#
+# Runs the Mamba selective-scan forward pass on the GPU (Metal) via Apple's
+# MLX C++ API (libmlx.dylib). This is the "no ggml" GPU path: ggml's Metal
+# tensor API is disabled on pre-M5 / pre-A19 silicon, but MLX's GPU works on
+# all Apple Silicon (verified on M2).
+#
+# We locate libmlx.dylib inside the pip-installed `mlx` package. The include
+# dir and lib dir can be overridden with -DMLX_DIR=<path> (the mlx package
+# root, i.e. the dir containing include/mlx and lib/libmlx.dylib).
+# ---------------------------------------------------------------------------
+
+set(REMORA_HAVE_MLX OFF)
+if(APPLE)
+    # Try to find the pip-installed mlx package.
+    if(NOT MLX_DIR)
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E env "PATH=$ENV{PATH}"
+                python3 -c "import mlx,os;print(os.path.dirname(mlx.__file__))"
+            OUTPUT_VARIABLE MLX_PY_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _mlx_rc)
+        if(_mlx_rc EQUAL 0 AND EXISTS "${MLX_PY_DIR}/lib/libmlx.dylib")
+            set(MLX_DIR "${MLX_PY_DIR}")
+        endif()
+    endif()
+
+    if(MLX_DIR AND EXISTS "${MLX_DIR}/include/mlx/mlx.h" AND
+       EXISTS "${MLX_DIR}/lib/libmlx.dylib")
+        message(STATUS "[remora] building remora_mlx with MLX at ${MLX_DIR}")
+        add_executable(remora_mlx src/main_mlx.cpp)
+        target_include_directories(remora_mlx PRIVATE
+            src
+            "${MLX_DIR}/include")
+        target_link_libraries(remora_mlx PRIVATE
+            remora_core
+            "${MLX_DIR}/lib/libmlx.dylib")
+        # rpath so libmlx.dylib is found at runtime.
+        set_target_properties(remora_mlx PROPERTIES
+            BUILD_RPATH "${MLX_DIR}/lib;${BUILD_RPATH}"
+            INSTALL_RPATH "${MLX_DIR}/lib;${INSTALL_RPATH}")
+        set(REMORA_HAVE_MLX ON)
+        # The MLX engine (mlx_engine.cpp) only compiles when MLX is present.
+        target_sources(remora_core PRIVATE src/mlx_engine.cpp)
+        target_include_directories(remora_core PRIVATE "${MLX_DIR}/include")
+    else()
+        message(WARNING
+            "[remora] MLX not found (pip install mlx). Skipping remora_mlx.\n"
+            "         Pass -DMLX_DIR=<path-to-mlx-pkg> to enable the MLX GPU driver.")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # remora_llama — libllama-based driver that runs the model from sharded

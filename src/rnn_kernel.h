@@ -49,6 +49,7 @@ struct TensorDesc {
     std::string dtype;        // "F32", "Q4_K", "Q6_K", "Q5_0", ...
     std::size_t offset = 0;   // byte offset within the shard
     std::size_t size = 0;     // byte size within the shard
+    int64_t n_elements = 0;   // element count (from the sidecar)
 };
 
 struct LayerDesc {

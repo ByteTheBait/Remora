@@ -161,15 +161,24 @@ token, which expert blocks to sweep.
 ├── CMakeLists.txt         # Cross-platform build configuration (C++20)
 ├── third_party/           # Submodules (ggml / llama.cpp core)
 ├── scripts/               # Sharding utility scripts
-│   └── shard_gguf.py      # Script to slice a standard GGUF into layer files
+│   ├── shard_gguf.py      # Script to slice a standard GGUF into layer files
+│   ├── convert_mlx.py     # Hugging Face -> MLX (via mlx_lm.convert)
+│   ├── shard_mlx.py       # Slice an MLX model into layer files
+│   ├── run_mlx.py         # Run an MLX model natively on Apple Silicon
+│   ├── bench_mlx.py       # Benchmark an MLX model (tokens/sec, peak mem)
+│   ├── bench_mlx_compare.sh # MLX vs Remora vs llama.cpp comparison
+│   └── bench_compare.sh   # Remora vs llama.cpp comparison (GGUF)
 ├── src/
-│   ├── main.cpp           # Entry point and runtime execution loop
+│   ├── main.cpp           # Entry point and runtime execution loop (ggml)
+│   ├── main_mlx.cpp       # MLX GPU driver entry point (Metal, --batch/--buffer-layers)
 │   ├── draft_router.cpp   # Draft model execution and expert selection logic
 │   ├── layer_streamer.cpp # Asynchronous DMA / mmap layer loader
+│   ├── mlx_engine.cpp     # MLX GPU compute engine (bounded cache, batch)
 │   └── rnn_kernel.cpp     # Custom GGML math kernels for Mamba/RWKV layers
 └── examples/
     ├── basic_routing.json # Sample routing configuration map
-    └── run_demo.sh        # Script to download a small model, shard it, and run it
+    ├── run_demo.sh        # Script to download a small model, shard it, and run it
+    └── run_mlx_demo.sh    # Script to convert a HF model to MLX, shard it, and run it
 ```
 
 ---
@@ -223,6 +232,184 @@ streamed from disk with a constant O(1) resident state.
 
 ---
 
+## MLX Support (Apple Silicon)
+
+Remora also supports the **MLX** runtime (Apple's array framework for Metal).
+This lets you convert a Hugging Face checkpoint to MLX format, shard it into
+the same per-layer layout, and run it natively on Apple Silicon — no GGUF
+round-trip required.
+
+### Prerequisites
+
+```bash
+pip install mlx mlx-lm torch safetensors
+```
+
+### Convert a Hugging Face model to MLX
+
+```bash
+python3 scripts/convert_mlx.py \
+    --hf-path state-spaces/mamba-130m-hf \
+    --mlx-path mlx_model \
+    --dtype float16
+```
+
+This wraps `mlx_lm.convert`. If the checkpoint only ships `.bin` weights
+(e.g. `state-spaces/mamba-130m`), it transparently converts them to
+safetensors first so the MLX converter can proceed.
+
+### Shard the MLX model into per-layer files
+
+```bash
+python3 scripts/shard_mlx.py mlx_model --out layers_mlx
+```
+
+This produces the same `blk.N` / `blk.N.meta.json` / `global.bin` /
+`manifest.json` layout as `shard_gguf.py`, so the C++ layer streamer can
+consume it unchanged.
+
+### Run the MLX model natively
+
+```bash
+python3 scripts/run_mlx.py \
+    --model mlx_model \
+    --prompt "Hello, my name is" \
+    --tokens 32 \
+    --temp 0.7
+```
+
+This loads the converted MLX model and runs generation on the Metal backend
+via `mlx_lm`. It's the MLX-native inference path — the same weights, but
+executed by Apple's MLX runtime rather than the C++ ggml streamer.
+
+### One-shot demo
+
+```bash
+./examples/run_mlx_demo.sh
+```
+
+This converts `state-spaces/mamba-130m-hf` to MLX, shards it, and runs it.
+
+### Benchmark MLX vs Remora vs llama.cpp
+
+```bash
+./scripts/bench_mlx_compare.sh
+```
+
+This runs the MLX-native inference path on a converted model and prints a
+side-by-side table against the existing Remora / llama.cpp numbers in
+`bench_results.txt`. For the Mamba 1.4B model the headline tradeoff is:
+
+| metric | MLX (Metal) | Remora (C++) | llama.cpp |
+| ------ | ----------- | ------------ | --------- |
+| gen tok/s | ~26 | ~10 | ~53 |
+| peak mem (MiB) | ~2847 | ~199 | ~873 |
+
+MLX is the fastest *native* path on Apple Silicon and needs no sharding, but
+it holds the full model resident in memory. Remora's layer-by-layer streamer
+uses ~7x less memory by keeping only the active layer + lookahead resident —
+the tradeoff for that memory win is lower throughput. This is exactly the
+design point Remora targets: **capacity and memory efficiency over raw
+speed**, so you can hold hundreds of expert models on one SSD.
+
+### How it fits together
+
+| Path | Weights source | Runtime | Use case |
+| ---- | -------------- | ------- | -------- |
+| `shard_gguf.py` + `remora` | GGUF | C++ ggml streamer | layer-by-layer streaming from SSD |
+| `convert_mlx.py` + `shard_mlx.py` + `remora_mlx` | HF checkpoint | C++ MLX (Metal) | GPU-accelerated streaming on Apple Silicon |
+| `run_mlx.py` | MLX model dir | MLX (Metal) | quick native generation |
+
+The MLX shards are byte-compatible with the C++ streamer's expected layout, so
+you can convert a model to MLX, shard it, and feed it to the C++ runtime — or
+run it natively with `run_mlx.py` — whichever fits your workload.
+
+---
+
+## C++ MLX GPU Driver (`remora_mlx`)
+
+`remora_mlx` is the "no ggml" GPU path: it runs the Mamba forward pass on
+Apple Silicon's GPU (Metal) via the MLX C++ API, while streaming the same
+per-layer shard files the ggml streamer consumes. ggml's Metal tensor API is
+disabled on pre-M5 / pre-A19 silicon, but MLX's GPU backend works on all
+Apple Silicon — so this driver gives real GPU acceleration where the ggml
+`remora` binary cannot.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j --target remora_mlx
+
+./build/remora_mlx \
+    --layers layers_q4 \          # sharded Q4 model (see below)
+    --tokenizer mlx_model \       # source MLX model dir (tokenizer.json)
+    --prompt "Hello, my name is" \
+    --tokens 64 \
+    --temperature 0.0 \
+    --buffer-layers 4 \
+    --batch 2
+```
+
+### Shard a Q4 (4-bit) model for the GPU driver
+
+The 4-bit affine quantized path (`layers_q4/`) keeps U32-packed weights + F16
+scales/biases on the GPU and runs the heavy projections via `quantized_matmul`,
+so it never materializes full F32 weight matrices. Use `mlx_lm.convert` to
+produce a 4-bit MLX model, then `shard_mlx.py` on it:
+
+```bash
+python3 -m mlx_lm.convert --hf-path <model> -q --q-bits 4 \
+    --out-path mlx_model_q4
+python3 scripts/shard_mlx.py mlx_model_q4 --out layers_q4
+```
+
+The unquantized F16 path (`layers_mlx/`) decodes every shard to F32 on the host
+and re-uploads to the GPU; combined with the full-model cache it can exceed RAM
+on small machines. Prefer the Q4 shards for the GPU driver.
+
+### Bounded cache — memory tracks the stream window
+
+By default the MLX engine caches every block it has touched (host decode +
+GPU arrays), so peak RSS scales with the **whole model**. To restore the
+streaming design's memory bound, cap the cache with `--buffer-layers`: only
+`~(buffer-layers + 1)` blocks stay resident at once, and evicted blocks
+re-decode on next access. This is what lets a model larger than RAM run
+without OOM.
+
+| `--buffer-layers` | gen tok/s | TTFT | peak RSS |
+| ----------------- | --------- | ---- | -------- |
+| 1  (bounded)      | 3.04      | 3869 ms | ~330 MB |
+| 8                 | 3.11      | 3294 ms | ~569 MB |
+| 48 (all resident) | 10.02     | 1283 ms | ~1.56 GB |
+
+The tradeoff is throughput: a small window avoids holding the whole model but
+re-decodes evicted blocks every token, so it is slower. A large window (or
+the default 48) is fastest but holds the model resident.
+
+### Batch parallelism (`--batch N`) — one resident layer, many streams
+
+`--batch N` runs N **independent** token streams through a *single*
+streamed-in layer buffer — the weights are read-only and shared, so only one
+resident copy is needed and peak RSS does **not** multiply with batch size.
+Each stream owns only its own tiny hidden/SSM/conv state.
+
+Because MLX Metal `eval` is not thread-safe for concurrent GPU access, the
+heavy matmuls are serialized under a mutex; the host-side selective-scan /
+conv / gating — the real Mamba bottleneck — overlap across threads.
+
+> **Important:** the Mamba SSM recurrence is sequential within a single
+> stream (token *N+1* depends on token *N*'s state). So batch parallelism
+> covers *independent sequences* only — it cannot parallelize the tokens of
+> one stream. This is the same O(1)-state contract the rest of Remora relies on.
+
+```bash
+./build/remora_mlx --layers layers_q4 --tokenizer mlx_model \
+    --tokens 64 --temperature 0.0 --batch 4 --buffer-layers 1
+```
+
+With 4 independent streams and a bounded window, peak RSS stays ~422 MB.
+
+---
+
 ## How It Works
 
 ### Phase 1 — Core Engine (C++)
@@ -242,6 +429,18 @@ streamed from disk with a constant O(1) resident state.
 - **`scripts/shard_gguf.py`** — Reads a compiled GGUF, isolates the global
   tensors (`token_embd`, `output`), and writes each sequential block
   (`blk.0`, `blk.1`, ...) to its own binary payload.
+- **`scripts/convert_mlx.py`** — Wraps `mlx_lm.convert` to turn a Hugging Face
+  checkpoint into an MLX model directory (handling `.bin`-only checkpoints by
+  converting them to safetensors first).
+- **`scripts/shard_mlx.py`** — Slices an MLX model directory into the same
+  per-layer `blk.N` / `global.bin` / `manifest.json` layout as `shard_gguf.py`.
+- **`scripts/run_mlx.py`** — Loads an MLX model and runs generation natively
+  on Apple Silicon via `mlx_lm`.
+- **`scripts/bench_mlx.py`** — Forces exactly N tokens (ignoring EOS) to get a
+  clean tokens/sec number, plus prompt tok/s and peak memory.
+- **`scripts/bench_mlx_compare.sh`** — Runs the MLX benchmark and prints a
+  side-by-side table against the Remora / llama.cpp numbers in
+  `bench_results.txt`.
 - **`draft_router.cpp`** — Hosts a tiny (~300M) draft model that stays
   permanently resident. It classifies the task and selects an expert ID from a
   JSON routing table (`examples/basic_routing.json`).
@@ -254,6 +453,13 @@ This README.
 
 ## Roadmap
 
+- [x] MLX support: `convert_mlx.py` (HF -> MLX via `mlx_lm.convert`),
+      `shard_mlx.py` (MLX -> per-layer shards), `run_mlx.py` (native Metal
+      inference), `bench_mlx.py` + `bench_mlx_compare.sh` (MLX benchmark
+      vs Remora / llama.cpp)
+- [x] `remora_mlx` C++ MLX GPU driver: Metal-accelerated forward on the same
+      per-layer shards, with a bounded LRU weight cache (peak RSS tracks
+      `--buffer-layers`) and `--batch N` shared-layer parallelism
 - [ ] Wire the RNN kernels to real GGML math (Mamba / RWKV selective scan)
 - [ ] Integrate `io_uring` on Linux for registered, pinned I/O buffers
 - [ ] Add CUDA / Metal backends for the streaming buffers

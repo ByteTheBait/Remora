@@ -6,10 +6,18 @@ build/
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Sharded model layers
 layers/
+layers_mlx/
+layers_q4/
 *.gguf
+
+# MLX converted model + benchmark output
+mlx_model/
+mlx_model_q4/
+bench_mlx_results.txt
 
 # Bench scratch: per-run logs and latest results
 llama.stdout.log
