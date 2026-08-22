@@ -305,6 +305,7 @@ Four inference paths, one model. All numbers are for the Mamba 1.4B model
 | TTFT (ms) | 704 | 2302 | 3294 | 2130 |
 | peak RSS (MiB) | ~2779 | ~339 | ~1151 | ~822 |
 
+The computer i am using is an 8gb RAM mac m2
 Notes:
 - **MLX (native)** is `scripts/bench_mlx.py` on the converted F16 model. It
   uses MLX's Metal backend and needs no sharding, but holds the full model
